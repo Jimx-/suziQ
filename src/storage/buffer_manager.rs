@@ -1,7 +1,7 @@
 use crate::storage::page_cache::*;
 use crate::storage::*;
 
-use std::{option::Option, rc::Rc, sync::Mutex};
+use std::{rc::Rc, sync::Mutex};
 
 pub struct BufferManager {
     smgr: Rc<StorageManager>,
@@ -16,33 +16,46 @@ impl BufferManager {
     }
 
     pub fn new_page(&self, shandle: &StorageHandle) -> Result<PagePtr> {
-        self.fetch_page_common(shandle, shandle.file_ref(), None)
+        self.page_cache
+            .lock()
+            .unwrap()
+            .new_page(&self.smgr, shandle, shandle.file_ref())
     }
 
     pub fn fetch_page(&self, shandle: &StorageHandle, page_num: usize) -> Result<PagePtr> {
-        self.fetch_page_common(shandle, shandle.file_ref(), Some(page_num))
+        self.page_cache.lock().unwrap().fetch_page(
+            &self.smgr,
+            shandle,
+            shandle.file_ref(),
+            page_num,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::storage_manager::get_temp_smgr;
+
+    fn get_temp_bufmgr(
+        cache_capacity: usize,
+    ) -> (BufferManager, Rc<StorageManager>, tempfile::TempDir) {
+        let (smgr, db_dir) = get_temp_smgr();
+        let smgr = Rc::new(smgr);
+        let bufmgr = BufferManager::new(smgr.clone(), cache_capacity);
+        (bufmgr, smgr, db_dir)
     }
 
-    fn fetch_page_common(
-        &self,
-        shandle: &StorageHandle,
-        rel: RelFileRef,
-        page_idx: Option<usize>,
-    ) -> Result<PagePtr> {
-        let page_ptr = match page_idx {
-            None => self
-                .page_cache
-                .lock()
-                .unwrap()
-                .new_page(&self.smgr, rel, 0)?,
+    #[test]
+    fn can_allocate_page() {
+        let (bufmgr, smgr, db_dir) = get_temp_bufmgr(10);
+        let shandle = smgr.open(0, 0).unwrap();
+        assert!(smgr.create(&shandle, false).is_ok());
+        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(0));
 
-            Some(page_num) => self
-                .page_cache
-                .lock()
-                .unwrap()
-                .fetch_page(&self.smgr, shandle, rel, page_num)?,
-        };
+        assert!(bufmgr.new_page(&shandle).is_ok());
+        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
 
-        Ok(page_ptr)
+        assert!(db_dir.close().is_ok());
     }
 }

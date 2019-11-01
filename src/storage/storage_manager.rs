@@ -124,7 +124,6 @@ impl StorageManager {
             file.seek(SeekFrom::Start(page_num as u64 * PAGE_SIZE as u64))?;
             match file.read_exact(buffer) {
                 Err(e) => {
-                    println!("{:?}", e);
                     if e.kind() == io::ErrorKind::UnexpectedEof {
                         Err(Error::DataCorrupted(format!(
                             "could not read page {} of relation {}: unexpected EOF",
@@ -241,19 +240,19 @@ impl StorageManager {
 }
 
 #[cfg(test)]
+pub fn get_temp_smgr() -> (StorageManager, tempfile::TempDir) {
+    let db_dir = tempfile::tempdir().unwrap();
+    let smgr = StorageManager::new(&db_dir.path());
+
+    (smgr, db_dir)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    fn get_temp_smgr() -> (StorageManager, tempfile::TempDir) {
-        let db_dir = tempfile::tempdir().unwrap();
-        let smgr = StorageManager::new(&db_dir.path());
-
-        (smgr, db_dir)
-    }
-
     #[test]
     fn can_create_relation() {
-        let (smgr, db_dir) = get_temp_smgr();
+        let (smgr, db_dir) = super::get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
         assert!(smgr.create(&shandle, false).is_ok());
         assert!(shandle.file.lock().unwrap().is_some());

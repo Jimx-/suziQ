@@ -59,9 +59,12 @@ impl PageCache {
     pub fn new_page(
         &mut self,
         smgr: &StorageManager,
+        shandle: &StorageHandle,
         rel: RelFileRef,
-        page_num: usize,
     ) -> Result<PagePtr> {
+        let page_num = smgr.file_size_in_page(shandle)?;
+        let temp_buf = [0u8; PAGE_SIZE];
+        smgr.write(shandle, page_num, &temp_buf)?;
         let page_ptr = self.alloc_page(smgr, rel, page_num)?;
 
         page_ptr.with_write(|page| {
@@ -104,18 +107,17 @@ impl PageCache {
     }
 
     pub fn _release_page(&mut self, page_ptr: PagePtr) -> Result<()> {
-        let (pin_count, file_ref, page_num, slot) = page_ptr.with_write(|page| {
+        page_ptr.with_write(|page| {
             let pin_count = page.unpin();
             let (file_ref, page_num) = page.get_file_and_num();
             let slot = page.slot();
-            Ok((pin_count, file_ref, page_num, slot))
-        })?;
 
-        if pin_count == 0 {
-            self.lru.put(PageTag(file_ref, page_num), slot);
-        }
+            if pin_count == 0 {
+                self.lru.put(PageTag(file_ref, page_num), slot);
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn evict(&mut self, _smgr: &StorageManager) -> Option<PagePtr> {
