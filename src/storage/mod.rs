@@ -1,23 +1,24 @@
-use std::{
-    fmt,
-    sync::{Arc, RwLock},
-};
-
 pub mod consts;
 
 mod buffer_manager;
 mod page_cache;
 mod storage_manager;
+mod table;
 
 use crate::*;
 
-use std::ops::{Deref, DerefMut};
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+    sync::{Arc, RwLock},
+};
 
 use self::consts::PAGE_SIZE;
 
 pub use self::{
     buffer_manager::BufferManager,
     storage_manager::{StorageHandle, StorageManager},
+    table::{Table, TableData, TablePtr},
 };
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
