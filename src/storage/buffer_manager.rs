@@ -12,21 +12,14 @@ impl BufferManager {
     pub fn new(smgr: Rc<StorageManager>, cache_capacity: usize) -> Self {
         let page_cache = Mutex::new(PageCache::new(cache_capacity));
 
-        Self {
-            smgr: smgr,
-            page_cache: page_cache,
-        }
+        Self { smgr, page_cache }
     }
 
     pub fn new_page(&self, shandle: &StorageHandle) -> Result<PagePtr> {
         self.fetch_page_common(shandle, shandle.file_ref(), None)
     }
 
-    pub fn fetch_page(
-        &self,
-        shandle: &StorageHandle,
-        page_num: usize,
-    ) -> Result<PagePtr> {
+    pub fn fetch_page(&self, shandle: &StorageHandle, page_num: usize) -> Result<PagePtr> {
         self.fetch_page_common(shandle, shandle.file_ref(), Some(page_num))
     }
 
@@ -37,7 +30,11 @@ impl BufferManager {
         page_idx: Option<usize>,
     ) -> Result<PagePtr> {
         let page_ptr = match page_idx {
-            None => self.page_cache.lock().unwrap().new_page(&self.smgr, rel, 0)?,
+            None => self
+                .page_cache
+                .lock()
+                .unwrap()
+                .new_page(&self.smgr, rel, 0)?,
 
             Some(page_num) => self
                 .page_cache

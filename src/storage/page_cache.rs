@@ -20,7 +20,7 @@ impl PageCache {
             lru: LruCache::new(cache_capacity),
             page_hash: HashMap::new(),
             page_pool: Vec::new(),
-            cache_capacity: cache_capacity,
+            cache_capacity,
         }
     }
 
@@ -43,11 +43,11 @@ impl PageCache {
         } else {
             match self.evict(smgr) {
                 Some(page_ptr) => {
-                    let slot = page_ptr.with_write(|page| {
+                    page_ptr.with_write(|page| {
                         page.set_file_and_num(tag.0, tag.1);
-                        page.slot()
-                    });
-                    self.page_hash.insert(tag, slot);
+                        self.page_hash.insert(tag, page.slot());
+                        Ok(())
+                    })?;
 
                     Ok(page_ptr.clone())
                 }
@@ -66,7 +66,8 @@ impl PageCache {
 
         page_ptr.with_write(|page| {
             page.pin();
-        });
+            Ok(())
+        })?;
 
         Ok(page_ptr)
     }
@@ -84,7 +85,7 @@ impl PageCache {
             Some(slot) => {
                 let page_ptr = self.page_pool[*slot].clone();
 
-                let pin_count = page_ptr.with_write(|page| page.pin());
+                let pin_count = page_ptr.with_write(|page| Ok(page.pin()))?;
 
                 if pin_count == 1 {
                     self.lru.pop(&tag);
@@ -95,26 +96,26 @@ impl PageCache {
             None => {
                 let page_ptr = self.alloc_page(smgr, rel, page_num)?;
 
-                page_ptr.with_write(|_page| {
-                    smgr.read(shandle, page_num);
-                });
+                page_ptr.with_write(|page| smgr.read(shandle, page_num, page.buffer_mut()))?;
 
                 Ok(page_ptr)
             }
         }
     }
 
-    pub fn _release_page(&mut self, page_ptr: PagePtr) {
+    pub fn _release_page(&mut self, page_ptr: PagePtr) -> Result<()> {
         let (pin_count, file_ref, page_num, slot) = page_ptr.with_write(|page| {
             let pin_count = page.unpin();
             let (file_ref, page_num) = page.get_file_and_num();
             let slot = page.slot();
-            (pin_count, file_ref, page_num, slot)
-        });
+            Ok((pin_count, file_ref, page_num, slot))
+        })?;
 
         if pin_count == 0 {
             self.lru.put(PageTag(file_ref, page_num), slot);
         }
+
+        Ok(())
     }
 
     fn evict(&mut self, _smgr: &StorageManager) -> Option<PagePtr> {

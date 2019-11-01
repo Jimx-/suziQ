@@ -11,6 +11,7 @@ pub enum Error {
     Io(io::Error),
     FileAccess(String),
     WrongObjectType(String),
+    DataCorrupted(String),
     OutOfMemory,
 }
 

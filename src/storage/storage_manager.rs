@@ -3,7 +3,8 @@ use crate::*;
 
 use std::{
     collections::HashMap,
-    fs::{DirBuilder, File},
+    fs::{DirBuilder, File, OpenOptions},
+    io::{self, prelude::*, SeekFrom},
     ops::Deref,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -20,7 +21,7 @@ pub struct StorageHandle(Arc<StorageHandleInner>);
 impl StorageHandle {
     pub fn new(file_ref: RelFileRef) -> Self {
         Self(Arc::new(StorageHandleInner {
-            file_ref: file_ref,
+            file_ref,
             file: Mutex::new(None),
         }))
     }
@@ -49,7 +50,7 @@ impl StorageManager {
         dir_builder.lock().unwrap().recursive(true);
         Self {
             base_path: base_path.as_ref().to_path_buf(),
-            dir_builder: dir_builder,
+            dir_builder,
             shandles: Mutex::new(HashMap::new()),
         }
     }
@@ -59,7 +60,7 @@ impl StorageManager {
         let mut guard = self.shandles.lock().unwrap();
         let handle = guard
             .entry(file_ref)
-            .or_insert(StorageHandle::new(file_ref));
+            .or_insert_with(|| StorageHandle::new(file_ref));
         Ok(handle.clone())
     }
 
@@ -89,7 +90,11 @@ impl StorageManager {
                         )));
                     }
                 } else {
-                    File::create(rel_path)?
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open(rel_path)?
                 };
 
                 *guard = Some(file);
@@ -98,9 +103,108 @@ impl StorageManager {
         }
     }
 
-    pub fn read(&self, _shandle: &StorageHandle, _page_num: usize) {}
+    pub fn close(&self, shandle: &StorageHandle) -> Result<()> {
+        let mut guard = shandle.file.lock().unwrap();
 
-    pub fn write(&self, _shandle: &StorageHandle, _page_num: usize) {}
+        match &*guard {
+            None => {}
+            Some(_) => *guard = None,
+        }
+
+        Ok(())
+    }
+
+    pub fn read(
+        &self,
+        shandle: &StorageHandle,
+        page_num: usize,
+        buffer: &mut PageBuffer,
+    ) -> Result<()> {
+        self.with_rel_file(shandle, |file| {
+            file.seek(SeekFrom::Start(page_num as u64 * PAGE_SIZE as u64))?;
+            match file.read_exact(buffer) {
+                Err(e) => {
+                    println!("{:?}", e);
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        Err(Error::DataCorrupted(format!(
+                            "could not read page {} of relation {}: unexpected EOF",
+                            page_num,
+                            shandle.file_ref()
+                        )))
+                    } else {
+                        Err(Error::FileAccess(format!(
+                            "could not read page {} of relation {}",
+                            page_num,
+                            shandle.file_ref()
+                        )))
+                    }
+                }
+                _ => Ok(()),
+            }
+        })
+    }
+
+    pub fn write(
+        &self,
+        shandle: &StorageHandle,
+        page_num: usize,
+        buffer: &PageBuffer,
+    ) -> Result<()> {
+        self.with_rel_file(shandle, |file| {
+            file.seek(SeekFrom::Start(page_num as u64 * PAGE_SIZE as u64))?;
+            match file.write_all(buffer) {
+                Err(_) => Err(Error::FileAccess(format!(
+                    "could not write page {} of relation {}",
+                    page_num,
+                    shandle.file_ref()
+                ))),
+                _ => Ok(()),
+            }
+        })
+    }
+
+    pub fn file_size_in_page(&self, shandle: &StorageHandle) -> Result<usize> {
+        self.with_rel_file(shandle, |file| {
+            let metadata = file.metadata()?;
+
+            Ok(metadata.len() as usize / PAGE_SIZE)
+        })
+    }
+
+    pub fn truncate(&self, shandle: &StorageHandle, nr_pages: usize) -> Result<()> {
+        self.with_rel_file(shandle, |file| {
+            let metadata = file.metadata()?;
+            let cur_pages = metadata.len() as usize / PAGE_SIZE;
+
+            if cur_pages >= nr_pages {
+                file.set_len(nr_pages as u64 * PAGE_SIZE as u64)?;
+            }
+
+            Ok(())
+        })
+    }
+
+    pub fn sync(&self, shandle: &StorageHandle) -> Result<()> {
+        self.with_rel_file(shandle, |file| Ok(file.sync_data()?))
+    }
+    fn with_rel_file<F, R>(&self, shandle: &StorageHandle, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut File) -> Result<R>,
+    {
+        let mut guard = shandle.file.lock().unwrap();
+
+        match &mut *guard {
+            Some(file) => f(file),
+            guard_ref @ None => {
+                let rel_path = self.rel_path(shandle.file_ref);
+                let file = File::open(rel_path)?;
+
+                *guard_ref = Some(file);
+
+                f(guard_ref.as_mut().expect("impossbile"))
+            }
+        }
+    }
 
     fn ensure_database_path(&self, db: OID) -> Result<()> {
         let db_path = self.db_path(db);
@@ -141,22 +245,60 @@ mod tests {
     use super::*;
 
     fn get_temp_smgr() -> (StorageManager, tempfile::TempDir) {
-        let db_path = tempfile::tempdir().unwrap();
-        let smgr = StorageManager::new(&db_path.path());
+        let db_dir = tempfile::tempdir().unwrap();
+        let smgr = StorageManager::new(&db_dir.path());
 
-        (smgr, db_path)
+        (smgr, db_dir)
     }
 
     #[test]
     fn can_create_relation() {
-        let (smgr, db_path) = get_temp_smgr();
+        let (smgr, db_dir) = get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
         assert!(smgr.create(&shandle, false).is_ok());
+        assert!(shandle.file.lock().unwrap().is_some());
 
-        let mut rel_path = db_path.into_path().to_path_buf();
+        let mut rel_path = db_dir.path().to_path_buf();
         rel_path.push("0");
         rel_path.push("0");
 
         assert!(rel_path.is_file());
+    }
+
+    #[test]
+    fn can_read_write() {
+        let (smgr, db_dir) = get_temp_smgr();
+        let shandle = smgr.open(0, 0).unwrap();
+        assert!(smgr.create(&shandle, false).is_ok());
+
+        let wbuf = [1u8; PAGE_SIZE];
+        let mut rbuf = [0u8; PAGE_SIZE];
+
+        assert!(smgr.write(&shandle, 0, &wbuf).is_ok());
+        assert!(smgr.read(&shandle, 0, &mut rbuf).is_ok());
+        assert_eq!(&wbuf[..], &rbuf[..]);
+
+        assert!(db_dir.close().is_ok());
+    }
+
+    #[test]
+    fn can_truncate() {
+        let (smgr, db_dir) = get_temp_smgr();
+        let shandle = smgr.open(0, 0).unwrap();
+        assert!(smgr.create(&shandle, false).is_ok());
+
+        let wbuf = [1u8; PAGE_SIZE];
+
+        assert!(smgr.write(&shandle, 0, &wbuf).is_ok());
+        assert!(smgr.write(&shandle, 1, &wbuf).is_ok());
+        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(2));
+
+        assert!(smgr.truncate(&shandle, 1).is_ok());
+        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
+
+        assert!(smgr.truncate(&shandle, 3).is_ok());
+        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
+
+        assert!(db_dir.close().is_ok());
     }
 }
