@@ -10,9 +10,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ForkType {
+    Main = 0,
+    Last = 1,
+}
+
+const MAX_FORKS: usize = ForkType::Last as usize;
+
 pub struct StorageHandleInner {
     file_ref: RelFileRef,
-    file: Mutex<Option<File>>,
+    forks: [Mutex<Option<File>>; MAX_FORKS],
 }
 
 #[derive(Clone)]
@@ -22,7 +30,7 @@ impl StorageHandle {
     pub fn new(file_ref: RelFileRef) -> Self {
         Self(Arc::new(StorageHandleInner {
             file_ref,
-            file: Mutex::new(None),
+            forks: [Mutex::new(None); MAX_FORKS],
         }))
     }
     pub fn file_ref(&self) -> RelFileRef {
@@ -64,14 +72,14 @@ impl StorageManager {
         Ok(handle.clone())
     }
 
-    pub fn create(&self, shandle: &StorageHandle, redo: bool) -> Result<()> {
-        let mut guard = shandle.file.lock().unwrap();
+    pub fn create(&self, shandle: &StorageHandle, fork: ForkType, redo: bool) -> Result<()> {
+        let mut guard = shandle.forks[fork as usize].lock().unwrap();
         let RelFileRef { db, rel_id } = shandle.file_ref();
         match &*guard {
             Some(_) => Ok(()),
             None => {
                 self.ensure_database_path(db)?;
-                let rel_path = self.rel_path(RelFileRef { db, rel_id });
+                let rel_path = self.rel_path(RelFileRef { db, rel_id }, fork);
 
                 let file = if rel_path.exists() {
                     if rel_path.is_file() {
@@ -103,8 +111,8 @@ impl StorageManager {
         }
     }
 
-    pub fn close(&self, shandle: &StorageHandle) -> Result<()> {
-        let mut guard = shandle.file.lock().unwrap();
+    fn close_fork(&self, shandle: &StorageHandle, fork: ForkType) -> Result<()> {
+        let mut guard = shandle.forks[fork as usize].lock().unwrap();
 
         match &*guard {
             None => {}
@@ -114,13 +122,24 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn close(&self, shandle: StorageHandle) -> Result<()> {
+        let mut guard = self.shandles.lock().unwrap();
+        self.close_fork(&shandle, ForkType::Main)?;
+
+        let file_ref = shandle.file_ref();
+        guard.remove(&file_ref);
+
+        Ok(())
+    }
+
     pub fn read(
         &self,
         shandle: &StorageHandle,
+        fork: ForkType,
         page_num: usize,
         buffer: &mut PageBuffer,
     ) -> Result<()> {
-        self.with_rel_file(shandle, |file| {
+        self.with_fork(shandle, fork, |file| {
             file.seek(SeekFrom::Start(page_num as u64 * PAGE_SIZE as u64))?;
             match file.read_exact(buffer) {
                 Err(e) => {
@@ -146,10 +165,11 @@ impl StorageManager {
     pub fn write(
         &self,
         shandle: &StorageHandle,
+        fork: ForkType,
         page_num: usize,
         buffer: &PageBuffer,
     ) -> Result<()> {
-        self.with_rel_file(shandle, |file| {
+        self.with_fork(shandle, fork, |file| {
             file.seek(SeekFrom::Start(page_num as u64 * PAGE_SIZE as u64))?;
             match file.write_all(buffer) {
                 Err(_) => Err(Error::FileAccess(format!(
@@ -162,16 +182,16 @@ impl StorageManager {
         })
     }
 
-    pub fn file_size_in_page(&self, shandle: &StorageHandle) -> Result<usize> {
-        self.with_rel_file(shandle, |file| {
+    pub fn file_size_in_page(&self, shandle: &StorageHandle, fork: ForkType) -> Result<usize> {
+        self.with_fork(shandle, fork, |file| {
             let metadata = file.metadata()?;
 
             Ok(metadata.len() as usize / PAGE_SIZE)
         })
     }
 
-    pub fn truncate(&self, shandle: &StorageHandle, nr_pages: usize) -> Result<()> {
-        self.with_rel_file(shandle, |file| {
+    pub fn truncate(&self, shandle: &StorageHandle, fork: ForkType, nr_pages: usize) -> Result<()> {
+        self.with_fork(shandle, fork, |file| {
             let metadata = file.metadata()?;
             let cur_pages = metadata.len() as usize / PAGE_SIZE;
 
@@ -183,19 +203,19 @@ impl StorageManager {
         })
     }
 
-    pub fn sync(&self, shandle: &StorageHandle) -> Result<()> {
-        self.with_rel_file(shandle, |file| Ok(file.sync_data()?))
+    pub fn sync(&self, shandle: &StorageHandle, fork: ForkType) -> Result<()> {
+        self.with_fork(shandle, fork, |file| Ok(file.sync_data()?))
     }
-    fn with_rel_file<F, R>(&self, shandle: &StorageHandle, f: F) -> Result<R>
+    fn with_fork<F, R>(&self, shandle: &StorageHandle, fork: ForkType, f: F) -> Result<R>
     where
         F: FnOnce(&mut File) -> Result<R>,
     {
-        let mut guard = shandle.file.lock().unwrap();
+        let mut guard = shandle.forks[fork as usize].lock().unwrap();
 
         match &mut *guard {
             Some(file) => f(file),
             guard_ref @ None => {
-                let rel_path = self.rel_path(shandle.file_ref);
+                let rel_path = self.rel_path(shandle.file_ref, fork);
                 let file = File::open(rel_path)?;
 
                 *guard_ref = Some(file);
@@ -230,11 +250,11 @@ impl StorageManager {
         path.push(db.to_string());
         path
     }
-    fn rel_path(&self, file_ref: RelFileRef) -> PathBuf {
+    fn rel_path(&self, file_ref: RelFileRef, fork: ForkType) -> PathBuf {
         let mut path = self.base_path.clone();
         let RelFileRef { db, rel_id } = file_ref;
         path.push(db.to_string());
-        path.push(rel_id.to_string());
+        path.push(format!("{}_{}", rel_id, fork as usize));
         path
     }
 }
@@ -254,12 +274,12 @@ mod tests {
     fn can_create_relation() {
         let (smgr, db_dir) = super::get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
-        assert!(smgr.create(&shandle, false).is_ok());
-        assert!(shandle.file.lock().unwrap().is_some());
+        assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
+        assert!(shandle.forks[0].lock().unwrap().is_some());
 
         let mut rel_path = db_dir.path().to_path_buf();
         rel_path.push("0");
-        rel_path.push("0");
+        rel_path.push("0_0");
 
         assert!(rel_path.is_file());
     }
@@ -268,13 +288,13 @@ mod tests {
     fn can_read_write() {
         let (smgr, db_dir) = get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
-        assert!(smgr.create(&shandle, false).is_ok());
+        assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
 
         let wbuf = [1u8; PAGE_SIZE];
         let mut rbuf = [0u8; PAGE_SIZE];
 
-        assert!(smgr.write(&shandle, 0, &wbuf).is_ok());
-        assert!(smgr.read(&shandle, 0, &mut rbuf).is_ok());
+        assert!(smgr.write(&shandle, ForkType::Main, 0, &wbuf).is_ok());
+        assert!(smgr.read(&shandle, ForkType::Main, 0, &mut rbuf).is_ok());
         assert_eq!(&wbuf[..], &rbuf[..]);
 
         assert!(db_dir.close().is_ok());
@@ -284,19 +304,28 @@ mod tests {
     fn can_truncate() {
         let (smgr, db_dir) = get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
-        assert!(smgr.create(&shandle, false).is_ok());
+        assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
 
         let wbuf = [1u8; PAGE_SIZE];
 
-        assert!(smgr.write(&shandle, 0, &wbuf).is_ok());
-        assert!(smgr.write(&shandle, 1, &wbuf).is_ok());
-        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(2));
+        assert!(smgr.write(&shandle, ForkType::Main, 0, &wbuf).is_ok());
+        assert!(smgr.write(&shandle, ForkType::Main, 1, &wbuf).is_ok());
+        assert_eq!(
+            smgr.file_size_in_page(&shandle, ForkType::Main).ok(),
+            Some(2)
+        );
 
-        assert!(smgr.truncate(&shandle, 1).is_ok());
-        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
+        assert!(smgr.truncate(&shandle, ForkType::Main, 1).is_ok());
+        assert_eq!(
+            smgr.file_size_in_page(&shandle, ForkType::Main).ok(),
+            Some(1)
+        );
 
-        assert!(smgr.truncate(&shandle, 3).is_ok());
-        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
+        assert!(smgr.truncate(&shandle, ForkType::Main, 3).is_ok());
+        assert_eq!(
+            smgr.file_size_in_page(&shandle, ForkType::Main).ok(),
+            Some(1)
+        );
 
         assert!(db_dir.close().is_ok());
     }

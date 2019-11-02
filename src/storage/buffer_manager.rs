@@ -15,18 +15,24 @@ impl BufferManager {
         Self { smgr, page_cache }
     }
 
-    pub fn new_page(&self, shandle: &StorageHandle) -> Result<PagePtr> {
+    pub fn new_page(&self, shandle: &StorageHandle, fork: ForkType) -> Result<PagePtr> {
         self.page_cache
             .lock()
             .unwrap()
-            .new_page(&self.smgr, shandle, shandle.file_ref())
+            .new_page(&self.smgr, shandle, shandle.file_ref(), fork)
     }
 
-    pub fn fetch_page(&self, shandle: &StorageHandle, page_num: usize) -> Result<PagePtr> {
+    pub fn fetch_page(
+        &self,
+        shandle: &StorageHandle,
+        fork: ForkType,
+        page_num: usize,
+    ) -> Result<PagePtr> {
         self.page_cache.lock().unwrap().fetch_page(
             &self.smgr,
             shandle,
             shandle.file_ref(),
+            fork,
             page_num,
         )
     }
@@ -50,11 +56,17 @@ mod tests {
     fn can_allocate_page() {
         let (bufmgr, smgr, db_dir) = get_temp_bufmgr(10);
         let shandle = smgr.open(0, 0).unwrap();
-        assert!(smgr.create(&shandle, false).is_ok());
-        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(0));
+        assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
+        assert_eq!(
+            smgr.file_size_in_page(&shandle, ForkType::Main).ok(),
+            Some(0)
+        );
 
-        assert!(bufmgr.new_page(&shandle).is_ok());
-        assert_eq!(smgr.file_size_in_page(&shandle).ok(), Some(1));
+        assert!(bufmgr.new_page(&shandle, ForkType::Main).is_ok());
+        assert_eq!(
+            smgr.file_size_in_page(&shandle, ForkType::Main).ok(),
+            Some(1)
+        );
 
         assert!(db_dir.close().is_ok());
     }

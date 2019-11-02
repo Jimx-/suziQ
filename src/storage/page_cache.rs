@@ -5,7 +5,7 @@ use lru::LruCache;
 use std::{collections::HashMap, vec::Vec};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-struct PageTag(RelFileRef, usize);
+struct PageTag(RelFileRef, ForkType, usize);
 
 pub struct PageCache {
     lru: LruCache<PageTag, usize>,
@@ -29,13 +29,14 @@ impl PageCache {
         &mut self,
         smgr: &StorageManager,
         rel: RelFileRef,
+        fork: ForkType,
         page_num: usize,
     ) -> Result<PagePtr> {
-        let tag = PageTag(rel, page_num);
+        let tag = PageTag(rel, fork, page_num);
 
         if self.page_pool.len() < self.cache_capacity {
             let slot = self.page_pool.len();
-            let page_ptr = PagePtr::new(rel, page_num, slot);
+            let page_ptr = PagePtr::new(rel, fork, page_num, slot);
             self.page_pool.push(page_ptr.clone());
             self.page_hash.insert(tag, slot);
 
@@ -44,7 +45,7 @@ impl PageCache {
             match self.evict(smgr) {
                 Some(page_ptr) => {
                     page_ptr.with_write(|page| {
-                        page.set_file_and_num(tag.0, tag.1);
+                        page.set_fork_and_num(tag.0, tag.1, tag.2);
                         self.page_hash.insert(tag, page.slot());
                         Ok(())
                     })?;
@@ -61,11 +62,12 @@ impl PageCache {
         smgr: &StorageManager,
         shandle: &StorageHandle,
         rel: RelFileRef,
+        fork: ForkType,
     ) -> Result<PagePtr> {
-        let page_num = smgr.file_size_in_page(shandle)?;
+        let page_num = smgr.file_size_in_page(shandle, fork)?;
         let temp_buf = [0u8; PAGE_SIZE];
-        smgr.write(shandle, page_num, &temp_buf)?;
-        let page_ptr = self.alloc_page(smgr, rel, page_num)?;
+        smgr.write(shandle, fork, page_num, &temp_buf)?;
+        let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
 
         page_ptr.with_write(|page| {
             page.pin();
@@ -80,9 +82,10 @@ impl PageCache {
         smgr: &StorageManager,
         shandle: &StorageHandle,
         rel: RelFileRef,
+        fork: ForkType,
         page_num: usize,
     ) -> Result<PagePtr> {
-        let tag = PageTag(rel, page_num);
+        let tag = PageTag(rel, fork, page_num);
 
         match self.page_hash.get(&tag) {
             Some(slot) => {
@@ -97,9 +100,10 @@ impl PageCache {
                 Ok(page_ptr)
             }
             None => {
-                let page_ptr = self.alloc_page(smgr, rel, page_num)?;
+                let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
 
-                page_ptr.with_write(|page| smgr.read(shandle, page_num, page.buffer_mut()))?;
+                page_ptr
+                    .with_write(|page| smgr.read(shandle, fork, page_num, page.buffer_mut()))?;
 
                 Ok(page_ptr)
             }
@@ -109,11 +113,11 @@ impl PageCache {
     pub fn _release_page(&mut self, page_ptr: PagePtr) -> Result<()> {
         page_ptr.with_write(|page| {
             let pin_count = page.unpin();
-            let (file_ref, page_num) = page.get_file_and_num();
+            let (file_ref, fork, page_num) = page.get_fork_and_num();
             let slot = page.slot();
 
             if pin_count == 0 {
-                self.lru.put(PageTag(file_ref, page_num), slot);
+                self.lru.put(PageTag(file_ref, fork, page_num), slot);
             }
 
             Ok(())

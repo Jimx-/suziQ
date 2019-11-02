@@ -17,7 +17,7 @@ use self::consts::PAGE_SIZE;
 
 pub use self::{
     buffer_manager::BufferManager,
-    storage_manager::{StorageHandle, StorageManager},
+    storage_manager::{ForkType, StorageHandle, StorageManager},
     table::{Table, TableData, TablePtr},
 };
 
@@ -37,6 +37,7 @@ pub type PageBuffer = [u8; PAGE_SIZE];
 
 pub struct Page {
     file_ref: RelFileRef,
+    fork: ForkType,
     page_num: usize,
     slot: usize,
     buffer: PageBuffer,
@@ -59,12 +60,13 @@ impl Page {
         self.dirty = dirty;
     }
 
-    pub fn get_file_and_num(&self) -> (RelFileRef, usize) {
-        (self.file_ref, self.page_num)
+    pub fn get_fork_and_num(&self) -> (RelFileRef, ForkType, usize) {
+        (self.file_ref, self.fork, self.page_num)
     }
 
-    pub fn set_file_and_num(&mut self, file_ref: RelFileRef, page_num: usize) {
+    pub fn set_fork_and_num(&mut self, file_ref: RelFileRef, fork: ForkType, page_num: usize) {
         self.file_ref = file_ref;
+        self.fork = fork;
         self.page_num = page_num;
     }
 
@@ -93,9 +95,10 @@ impl Deref for PagePtr {
 }
 
 impl PagePtr {
-    pub fn new(file_ref: RelFileRef, page_num: usize, slot: usize) -> Self {
+    pub fn new(file_ref: RelFileRef, fork: ForkType, page_num: usize, slot: usize) -> Self {
         Self(Arc::new(RwLock::new(Page {
             file_ref,
+            fork,
             page_num,
             slot,
             buffer: [0u8; PAGE_SIZE],
