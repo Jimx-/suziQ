@@ -19,11 +19,17 @@ impl CatalogCache {
         }
     }
 
-    pub fn create_heap(&mut self, rel_id: OID, name: &str, schema: Schema) -> Result<TablePtr> {
+    pub fn create_heap(
+        &mut self,
+        db: OID,
+        rel_id: OID,
+        name: &str,
+        schema: Schema,
+    ) -> Result<TablePtr> {
         let mut guard = self.table_cache.write().unwrap();
         let entry = guard
             .entry(rel_id)
-            .or_insert_with(|| Arc::new(Heap::new(rel_id, name, schema)));
+            .or_insert_with(|| Arc::new(Heap::new(rel_id, db, name, schema)));
         Ok(entry.clone())
     }
 

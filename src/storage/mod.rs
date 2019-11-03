@@ -5,7 +5,7 @@ mod page_cache;
 mod storage_manager;
 mod table;
 
-use crate::*;
+use crate::{Relation, Result, OID};
 
 use std::{
     fmt,
@@ -121,5 +121,29 @@ impl PagePtr {
     {
         let mut guard = self.0.write().unwrap();
         f(guard.deref_mut())
+    }
+}
+
+pub trait RelationWithStorage: Relation {
+    fn get_storage_handle(&self) -> &std::sync::Mutex<Option<StorageHandle>>;
+
+    fn create_storage(&self, smgr: &StorageManager) -> Result<()> {
+        self.with_storage(smgr, |storage| smgr.create(storage, ForkType::Main, false))
+    }
+
+    fn with_storage<F, R>(&self, smgr: &StorageManager, f: F) -> Result<R>
+    where
+        F: FnOnce(&StorageHandle) -> Result<R>,
+    {
+        let mut guard = self.get_storage_handle().lock().unwrap();
+
+        match &*guard {
+            Some(shandle) => f(shandle),
+            None => {
+                let shandle = smgr.open(self.rel_db(), self.rel_id())?;
+                *guard = Some(shandle.clone());
+                f(&shandle)
+            }
+        }
     }
 }
