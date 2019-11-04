@@ -12,6 +12,7 @@ pub enum Error {
     FileAccess(String),
     WrongObjectType(String),
     DataCorrupted(String),
+    ProgramLimitExceed(String),
     OutOfMemory,
 }
 

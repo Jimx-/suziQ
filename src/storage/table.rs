@@ -1,4 +1,4 @@
-use crate::{catalog::Schema, Relation};
+use crate::{catalog::Schema, storage::ItemPointer, Relation, Result, DB};
 
 use std::sync::Arc;
 
@@ -18,6 +18,8 @@ pub trait Table: Relation {
     fn table_schema(&self) -> &Schema {
         &self.get_table_data().schema
     }
+
+    fn insert_tuple(&self, db: &DB, tuple: &[u8]) -> Result<ItemPointer>;
 }
 
 pub type TablePtr = Arc<dyn Table>;

@@ -36,12 +36,16 @@ impl BufferManager {
             page_num,
         )
     }
+
+    pub fn release_page(&self, page_ptr: PagePtr) -> Result<()> {
+        self.page_cache.lock().unwrap().release_page(page_ptr)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::storage_manager::get_temp_smgr;
+    use crate::test_util::get_temp_smgr;
 
     fn get_temp_bufmgr(
         cache_capacity: usize,

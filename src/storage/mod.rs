@@ -147,3 +147,20 @@ pub trait RelationWithStorage: Relation {
         }
     }
 }
+
+#[derive(Debug)]
+pub struct ItemPointer {
+    pub page_num: usize,
+    pub offset: usize,
+    pub length: usize,
+}
+
+impl ItemPointer {
+    pub fn new(page_num: usize, offset: usize, length: usize) -> Self {
+        Self {
+            page_num,
+            offset,
+            length,
+        }
+    }
+}

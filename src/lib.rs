@@ -2,7 +2,11 @@ pub mod am;
 pub mod catalog;
 pub mod storage;
 
+extern crate bincode;
+extern crate byteorder;
 extern crate lru;
+extern crate serde;
+extern crate serde_bytes;
 
 #[cfg(test)]
 extern crate tempfile;
@@ -11,6 +15,7 @@ mod config;
 mod db;
 mod relation;
 mod result;
+mod test_util;
 
 pub use self::{
     config::DBConfig,

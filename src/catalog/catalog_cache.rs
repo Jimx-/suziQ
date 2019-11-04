@@ -1,12 +1,7 @@
-use super::Schema;
+use crate::storage::TablePtr;
 use crate::*;
-use crate::{am::Heap, storage::TablePtr};
 
-use std::{
-    collections::HashMap,
-    option::Option,
-    sync::{Arc, RwLock},
-};
+use std::{collections::HashMap, option::Option, sync::RwLock};
 
 pub struct CatalogCache {
     table_cache: RwLock<HashMap<OID, TablePtr>>,
@@ -19,20 +14,11 @@ impl CatalogCache {
         }
     }
 
-    pub fn create_heap(
-        &mut self,
-        db: OID,
-        rel_id: OID,
-        name: &str,
-        schema: Schema,
-    ) -> Result<TablePtr> {
+    pub fn add_table(&self, table: TablePtr) -> Option<TablePtr> {
         let mut guard = self.table_cache.write().unwrap();
-        let entry = guard
-            .entry(rel_id)
-            .or_insert_with(|| Arc::new(Heap::new(rel_id, db, name, schema)));
-        Ok(entry.clone())
+        let rel_id = table.rel_id();
+        guard.insert(rel_id, table)
     }
-
     pub fn lookup_table(&self, rel_id: OID) -> Option<TablePtr> {
         let guard = self.table_cache.read().unwrap();
         match guard.get(&rel_id) {

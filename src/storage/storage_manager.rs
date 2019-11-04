@@ -260,19 +260,12 @@ impl StorageManager {
 }
 
 #[cfg(test)]
-pub fn get_temp_smgr() -> (StorageManager, tempfile::TempDir) {
-    let db_dir = tempfile::tempdir().unwrap();
-    let smgr = StorageManager::new(&db_dir.path());
-
-    (smgr, db_dir)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::get_temp_smgr;
     #[test]
     fn can_create_relation() {
-        let (smgr, db_dir) = super::get_temp_smgr();
+        let (smgr, db_dir) = get_temp_smgr();
         let shandle = smgr.open(0, 0).unwrap();
         assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
         assert!(shandle.forks[0].lock().unwrap().is_some());
