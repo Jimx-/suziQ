@@ -1,12 +1,15 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::{storage::consts::PAGE_SIZE, Error, Result};
+use crate::{
+    storage::{consts::PAGE_SIZE, PinnedPagePtr},
+    Error, Result,
+};
 
 const P_LOWER: usize = 0;
 const P_UPPER: usize = P_LOWER + 2;
 const P_POINTERS: usize = P_UPPER + 2;
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
 pub struct LinePointer {
     off: u16,
     len: u16,
@@ -40,17 +43,55 @@ pub trait HeapPageReader {
             size - LINE_POINTER_SIZE
         }
     }
+
+    fn num_line_pointers(&self) -> usize {
+        let lower = self.get_lower() as usize;
+
+        if lower < P_POINTERS {
+            0
+        } else {
+            (lower - P_POINTERS) / LINE_POINTER_SIZE
+        }
+    }
+
+    fn get_line_pointer(&self, offset: usize) -> LinePointer {
+        let buf = self.get_page_buffer();
+        let off = (&buf[P_POINTERS + offset * LINE_POINTER_SIZE..])
+            .read_u16::<LittleEndian>()
+            .unwrap();
+        let len = (&buf[P_POINTERS + offset * LINE_POINTER_SIZE + 2..])
+            .read_u16::<LittleEndian>()
+            .unwrap();
+
+        LinePointer { off, len }
+    }
+
+    fn get_item<'a>(&'a self, line_ptr: LinePointer) -> &'a [u8] {
+        let buf = self.get_page_buffer();
+        let LinePointer { off, len } = line_ptr;
+        &buf[off as usize..(off + len) as usize]
+    }
 }
 
-#[allow(dead_code)]
 pub struct HeapPageView<'a> {
     buffer: &'a [u8; PAGE_SIZE],
 }
 
-#[allow(dead_code)]
 impl<'a> HeapPageView<'a> {
     pub fn new(buffer: &'a [u8; PAGE_SIZE]) -> Self {
         Self { buffer }
+    }
+
+    pub fn with_page<F, R>(page: &PinnedPagePtr, f: F) -> Result<R>
+    where
+        F: Copy + FnOnce(&HeapPageView) -> Result<R>,
+    {
+        page.with_read(|page| {
+            let buffer = page.buffer();
+            let page_view = HeapPageView::new(buffer);
+
+            f(&page_view)
+        })
     }
 }
 
@@ -91,15 +132,15 @@ impl<'a> HeapPageViewMut<'a> {
     }
 
     fn put_line_pointer(&mut self, offset: usize, lp: &LinePointer) {
-        (&mut self.buffer[offset..])
-            .write_u16::<LittleEndian>(lp.len)
+        (&mut self.buffer[P_POINTERS + offset * LINE_POINTER_SIZE..])
+            .write_u16::<LittleEndian>(lp.off)
             .unwrap();
-        (&mut self.buffer[offset + 2..])
+        (&mut self.buffer[P_POINTERS + offset * LINE_POINTER_SIZE + 2..])
             .write_u16::<LittleEndian>(lp.len)
             .unwrap();
     }
 
-    pub fn put_tuple(&mut self, tuple: &[u8]) -> Result<(u16, u16)> {
+    pub fn put_tuple(&mut self, tuple: &[u8]) -> Result<usize> {
         let mut lower = self.get_lower();
         let mut upper = self.get_upper();
 
@@ -116,7 +157,8 @@ impl<'a> HeapPageViewMut<'a> {
             len: tuple.len() as u16,
         };
 
-        self.put_line_pointer(lower as usize, &lp);
+        let offset = self.num_line_pointers();
+        self.put_line_pointer(offset, &lp);
         lower += LINE_POINTER_SIZE as u16;
 
         (&mut self.buffer[upper as usize..upper as usize + tuple.len()]).copy_from_slice(tuple);
@@ -124,7 +166,7 @@ impl<'a> HeapPageViewMut<'a> {
         self.set_lower(lower);
         self.set_upper(upper);
 
-        Ok((lp.off, lp.len))
+        Ok(offset)
     }
 }
 

@@ -13,6 +13,7 @@ pub enum Error {
     WrongObjectType(String),
     DataCorrupted(String),
     ProgramLimitExceed(String),
+    InvalidState(String),
     OutOfMemory,
 }
 

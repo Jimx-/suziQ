@@ -18,7 +18,7 @@ use self::consts::PAGE_SIZE;
 pub use self::{
     buffer_manager::BufferManager,
     storage_manager::{ForkType, StorageHandle, StorageManager},
-    table::{Table, TableData, TablePtr},
+    table::{ScanDirection, Table, TableData, TablePtr, TableScanIterator},
 };
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -122,6 +122,11 @@ impl PagePtr {
         let mut guard = self.0.write().unwrap();
         f(guard.deref_mut())
     }
+
+    pub(self) fn pin(self) -> Result<(i32, PinnedPagePtr)> {
+        let pin_count = self.with_write(|page| Ok(page.pin()))?;
+        Ok((pin_count, PinnedPagePtr(self)))
+    }
 }
 
 pub trait RelationWithStorage: Relation {
@@ -146,21 +151,51 @@ pub trait RelationWithStorage: Relation {
             }
         }
     }
+
+    fn get_size_in_page(&self, smgr: &StorageManager) -> Result<usize> {
+        self.with_storage(smgr, |storage| {
+            smgr.file_size_in_page(storage, ForkType::Main)
+        })
+    }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+pub struct PinnedPagePtr(PagePtr);
+
+impl Deref for PinnedPagePtr {
+    type Target = PagePtr;
+
+    fn deref(&self) -> &PagePtr {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone)]
 pub struct ItemPointer {
     pub page_num: usize,
     pub offset: usize,
-    pub length: usize,
 }
 
 impl ItemPointer {
-    pub fn new(page_num: usize, offset: usize, length: usize) -> Self {
+    pub fn new(page_num: usize, offset: usize) -> Self {
+        Self { page_num, offset }
+    }
+
+    pub fn next_offset(&self) -> Self {
         Self {
-            page_num,
-            offset,
-            length,
+            page_num: self.page_num,
+            offset: self.offset + 1,
+        }
+    }
+
+    pub fn prev_offset(&self) -> Option<Self> {
+        if self.offset == 0 {
+            None
+        } else {
+            Some(Self {
+                page_num: self.page_num,
+                offset: self.offset - 1,
+            })
         }
     }
 }

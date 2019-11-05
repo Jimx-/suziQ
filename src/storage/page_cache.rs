@@ -63,18 +63,14 @@ impl PageCache {
         shandle: &StorageHandle,
         rel: RelFileRef,
         fork: ForkType,
-    ) -> Result<PagePtr> {
+    ) -> Result<PinnedPagePtr> {
         let page_num = smgr.file_size_in_page(shandle, fork)?;
         let temp_buf = [0u8; PAGE_SIZE];
         smgr.write(shandle, fork, page_num, &temp_buf)?;
         let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
 
-        page_ptr.with_write(|page| {
-            page.pin();
-            Ok(())
-        })?;
-
-        Ok(page_ptr)
+        let (_, pinned_page) = page_ptr.pin()?;
+        Ok(pinned_page)
     }
 
     pub fn fetch_page(
@@ -84,33 +80,33 @@ impl PageCache {
         rel: RelFileRef,
         fork: ForkType,
         page_num: usize,
-    ) -> Result<PagePtr> {
+    ) -> Result<PinnedPagePtr> {
         let tag = PageTag(rel, fork, page_num);
 
         match self.page_hash.get(&tag) {
             Some(slot) => {
                 let page_ptr = self.page_pool[*slot].clone();
 
-                let pin_count = page_ptr.with_write(|page| Ok(page.pin()))?;
+                let (pin_count, pinned_page) = page_ptr.pin()?;
 
                 if pin_count == 1 {
                     self.lru.pop(&tag);
                 }
 
-                Ok(page_ptr)
+                Ok(pinned_page)
             }
             None => {
                 let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
-
                 page_ptr
                     .with_write(|page| smgr.read(shandle, fork, page_num, page.buffer_mut()))?;
+                let (_, pinned_page) = page_ptr.pin()?;
 
-                Ok(page_ptr)
+                Ok(pinned_page)
             }
         }
     }
 
-    pub fn release_page(&mut self, page_ptr: PagePtr) -> Result<()> {
+    pub fn release_page(&mut self, page_ptr: PinnedPagePtr) -> Result<()> {
         page_ptr.with_write(|page| {
             let pin_count = page.unpin();
             let (file_ref, fork, page_num) = page.get_fork_and_num();

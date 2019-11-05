@@ -12,6 +12,18 @@ impl TableData {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ScanDirection {
+    Forward,
+    Backward,
+}
+
+pub trait TableScanIterator<'a> {
+    fn next(&mut self, db: &DB, dir: ScanDirection) -> Result<bool>;
+
+    fn get_data<'b>(&'b self) -> Option<&'b [u8]>;
+}
+
 pub trait Table: Relation {
     fn get_table_data(&self) -> &TableData;
 
@@ -20,6 +32,8 @@ pub trait Table: Relation {
     }
 
     fn insert_tuple(&self, db: &DB, tuple: &[u8]) -> Result<ItemPointer>;
+
+    fn begin_scan<'a>(&'a self, db: &DB) -> Result<Box<dyn TableScanIterator<'a> + 'a>>;
 }
 
 pub type TablePtr = Arc<dyn Table>;

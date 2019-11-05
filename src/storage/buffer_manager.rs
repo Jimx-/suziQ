@@ -15,7 +15,7 @@ impl BufferManager {
         Self { smgr, page_cache }
     }
 
-    pub fn new_page(&self, shandle: &StorageHandle, fork: ForkType) -> Result<PagePtr> {
+    pub fn new_page(&self, shandle: &StorageHandle, fork: ForkType) -> Result<PinnedPagePtr> {
         self.page_cache
             .lock()
             .unwrap()
@@ -27,7 +27,7 @@ impl BufferManager {
         shandle: &StorageHandle,
         fork: ForkType,
         page_num: usize,
-    ) -> Result<PagePtr> {
+    ) -> Result<PinnedPagePtr> {
         self.page_cache.lock().unwrap().fetch_page(
             &self.smgr,
             shandle,
@@ -37,7 +37,7 @@ impl BufferManager {
         )
     }
 
-    pub fn release_page(&self, page_ptr: PagePtr) -> Result<()> {
+    pub fn release_page(&self, page_ptr: PinnedPagePtr) -> Result<()> {
         self.page_cache.lock().unwrap().release_page(page_ptr)
     }
 }

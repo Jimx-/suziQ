@@ -1,13 +1,13 @@
 use crate::{
     catalog::Schema,
     storage::{
-        consts::PAGE_SIZE, ForkType, ItemPointer, RelationWithStorage, StorageHandle, Table,
-        TableData,
+        consts::PAGE_SIZE, ForkType, ItemPointer, PinnedPagePtr, RelationWithStorage,
+        ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
 
-use super::heap_page::{HeapPageReader, HeapPageViewMut};
+use super::heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut};
 
 use std::sync::Mutex;
 
@@ -19,8 +19,26 @@ fn tuple_size_limit() -> usize {
 
 #[derive(Serialize, Deserialize)]
 struct HeapTuple {
+    #[serde(skip)]
+    table_id: OID,
+    #[serde(skip)]
+    ptr: Option<ItemPointer>,
     #[serde(with = "serde_bytes")]
     data: Vec<u8>,
+}
+
+impl HeapTuple {
+    pub fn new(table_id: OID, data: &[u8]) -> Self {
+        Self {
+            table_id,
+            ptr: None,
+            data: data.to_vec(),
+        }
+    }
+
+    pub fn set_pointer(&mut self, ptr: ItemPointer) {
+        self.ptr = Some(ptr);
+    }
 }
 
 pub struct Heap {
@@ -44,9 +62,7 @@ impl Heap {
     }
 
     fn prepare_heap_tuple_for_insert(&self, data: &[u8]) -> HeapTuple {
-        HeapTuple {
-            data: data.to_vec(),
-        }
+        HeapTuple::new(self.rel_id(), data)
     }
 
     fn get_insert_hint(&self) -> Option<usize> {
@@ -145,11 +161,262 @@ impl Heap {
 
         Ok(result)
     }
+
+    fn get_next_tuple<'a>(
+        &'a self,
+        db: &DB,
+        iterator: &mut HeapScanIterator<'a>,
+        dir: ScanDirection,
+    ) -> Result<bool> {
+        let smgr = db.get_storage_manager();
+        let bufmgr = db.get_buffer_manager();
+
+        let mut offset: usize = 0;
+        let mut remaining_tuples: usize;
+        match dir {
+            ScanDirection::Forward => {
+                if !iterator.inited {
+                    if iterator.heap_pages == 0 {
+                        // empty heap, done
+                        return Ok(false);
+                    }
+
+                    let page_num = iterator.start_page;
+                    self.with_storage(smgr, |storage| iterator.fetch_page(db, storage, page_num))?;
+                    offset = 0;
+                    iterator.inited = true;
+                } else {
+                    // continue from last tuple
+                    let line_ptr = iterator.tuple.ptr.expect("impossible");
+                    let next_off = line_ptr.next_offset();
+                    offset = next_off.offset;
+                }
+
+                match &iterator.cur_page {
+                    None => {
+                        return Err(Error::InvalidState(
+                            "page not present for heap scan iterator".to_owned(),
+                        ))
+                    }
+                    Some(page) => {
+                        remaining_tuples = HeapPageView::with_page(page, |page_view| {
+                            Ok(page_view.num_line_pointers() - offset)
+                        })?;
+                    }
+                }
+            }
+            ScanDirection::Backward => {
+                if !iterator.inited {
+                    if iterator.heap_pages == 0 {
+                        // empty heap, done
+                        return Ok(false);
+                    }
+
+                    let page_num = if iterator.start_page > 0 {
+                        iterator.start_page
+                    } else {
+                        iterator.heap_pages
+                    } - 1;
+
+                    self.with_storage(smgr, |storage| iterator.fetch_page(db, storage, page_num))?;
+                    remaining_tuples = iterator.num_tuples;
+                    offset = if remaining_tuples > 0 {
+                        remaining_tuples - 1
+                    } else {
+                        0
+                    };
+                    iterator.inited = true;
+                } else {
+                    // continue from last tuple
+                    let line_ptr = iterator.tuple.ptr.expect("impossible");
+                    match line_ptr.prev_offset() {
+                        None => {
+                            remaining_tuples = 0;
+                        }
+                        Some(prev_off) => {
+                            offset = prev_off.offset;
+                            remaining_tuples = offset + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        loop {
+            match &iterator.cur_page {
+                Some(page) => {
+                    match HeapPageView::with_page(page, |page_view| {
+                        if remaining_tuples > 0 {
+                            let line_ptr = page_view.get_line_pointer(offset);
+                            let htup_buf = page_view.get_item(line_ptr);
+
+                            let mut htup = match bincode::deserialize::<HeapTuple>(htup_buf) {
+                                Ok(htup) => htup,
+                                _ => {
+                                    return Err(Error::DataCorrupted(
+                                        "cannot deserialize heap tuple".to_owned(),
+                                    ));
+                                }
+                            };
+
+                            htup.table_id = self.rel_id();
+                            htup.set_pointer(ItemPointer::new(iterator.cur_page_num, offset));
+
+                            Ok(Some(htup))
+                        } else {
+                            // we've scanned all tuples on the current page, go to the next page
+                            Ok(None)
+                        }
+                    })? {
+                        Some(htup) => {
+                            iterator.tuple = htup;
+                            return Ok(true);
+                        }
+
+                        None => {
+                            let mut finished;
+                            let mut next_page;
+
+                            match dir {
+                                // move to the next page
+                                ScanDirection::Forward => {
+                                    next_page = iterator.cur_page_num;
+                                    next_page += 1;
+
+                                    if next_page >= iterator.heap_pages {
+                                        next_page = 0;
+                                    }
+
+                                    finished = next_page == iterator.start_page;
+
+                                    match &mut iterator.max_pages {
+                                        Some(limit) => {
+                                            if *limit == 0 {
+                                                finished = true;
+                                            } else {
+                                                *limit -= 1;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ScanDirection::Backward => {
+                                    finished = iterator.cur_page_num == iterator.start_page;
+
+                                    match &mut iterator.max_pages {
+                                        Some(limit) => {
+                                            if *limit == 0 {
+                                                finished = true;
+                                            } else {
+                                                *limit -= 1;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+
+                                    next_page = if iterator.cur_page_num > 0 {
+                                        iterator.cur_page_num
+                                    } else {
+                                        iterator.heap_pages
+                                    } - 1;
+                                }
+                            }
+
+                            if finished {
+                                // no more pages
+                                let page = iterator.cur_page.take();
+
+                                match page {
+                                    Some(page) => {
+                                        bufmgr.release_page(page)?;
+                                    }
+                                    _ => {}
+                                }
+
+                                iterator.tuple = HeapTuple::new(self.rel_id(), &[]);
+                                iterator.inited = false;
+
+                                return Ok(false);
+                            }
+
+                            self.with_storage(smgr, |storage| {
+                                iterator.fetch_page(db, storage, next_page)
+                            })?;
+
+                            remaining_tuples = iterator.num_tuples;
+
+                            match dir {
+                                ScanDirection::Forward => {
+                                    offset = 0;
+                                }
+                                ScanDirection::Backward => {
+                                    offset = remaining_tuples - 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Ok(false);
+                }
+            }
+        }
+    }
 }
 
 impl Relation for Heap {
     fn get_relation_entry(&self) -> &RelationEntry {
         &self.rel_entry
+    }
+}
+
+pub struct HeapScanIterator<'a> {
+    heap: &'a Heap,
+    inited: bool,
+    tuple: HeapTuple,
+    cur_page: Option<PinnedPagePtr>,
+    cur_page_num: usize,
+    num_tuples: usize,
+    heap_pages: usize,
+    start_page: usize,
+    max_pages: Option<usize>,
+}
+
+impl<'a> HeapScanIterator<'a> {
+    fn fetch_page(&mut self, db: &DB, shandle: &StorageHandle, page_num: usize) -> Result<()> {
+        let bufmgr = db.get_buffer_manager();
+
+        let old_page = self.cur_page.take();
+        match old_page {
+            Some(page) => {
+                bufmgr.release_page(page)?;
+            }
+            _ => {}
+        }
+
+        let page = bufmgr.fetch_page(shandle, ForkType::Main, page_num)?;
+        self.cur_page_num = page_num;
+
+        self.num_tuples =
+            HeapPageView::with_page(&page, |page_view| Ok(page_view.num_line_pointers()))?;
+
+        self.cur_page = Some(page);
+
+        Ok(())
+    }
+}
+
+impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
+    fn next(&mut self, db: &DB, dir: ScanDirection) -> Result<bool> {
+        self.heap.get_next_tuple(db, self, dir)
+    }
+
+    fn get_data<'b>(&'b self) -> Option<&'b [u8]> {
+        if !self.inited {
+            None
+        } else {
+            Some(&self.tuple.data[..])
+        }
     }
 }
 
@@ -164,10 +431,28 @@ impl Table for Heap {
         let htup_len = htup_buf.len();
 
         let itemp = self.with_page_for_tuple(db, htup_len, |page_view, page_num| {
-            let (off, len) = page_view.put_tuple(&htup_buf)?;
-            Ok((ItemPointer::new(page_num, off as usize, len as usize), true))
+            let off = page_view.put_tuple(&htup_buf)?;
+            Ok((ItemPointer::new(page_num, off), true))
         })?;
         Ok(itemp)
+    }
+
+    fn begin_scan<'a>(&'a self, db: &DB) -> Result<Box<dyn TableScanIterator<'a> + 'a>> {
+        let smgr = db.get_storage_manager();
+        let heap_pages = self.get_size_in_page(smgr)?;
+        let heap_it = HeapScanIterator {
+            heap: &self,
+            inited: false,
+            tuple: HeapTuple::new(self.rel_id(), &[]),
+            cur_page: None,
+            cur_page_num: 0,
+            num_tuples: 0,
+            heap_pages,
+            start_page: 0,
+            max_pages: None,
+        };
+
+        Ok(Box::new(heap_it))
     }
 }
 
@@ -179,7 +464,7 @@ impl RelationWithStorage for Heap {
 
 #[cfg(test)]
 mod tests {
-    use crate::{catalog::Schema, test_util::get_temp_db};
+    use crate::{catalog::Schema, storage::ScanDirection, test_util::get_temp_db};
 
     #[test]
     fn can_create_heap() {
@@ -196,15 +481,29 @@ mod tests {
     }
 
     #[test]
-    fn can_insert_tuples() {
+    fn can_insert_and_scan_heap() {
         let (db, db_dir) = get_temp_db();
-        let heap_result = db.create_table(0, 0, Schema::new());
-        assert!(heap_result.is_ok());
-        let heap = heap_result.unwrap();
+        let heap = db.create_table(0, 0, Schema::new()).unwrap();
 
+        let data: &[u8] = &[1u8; 100];
         for _ in 0..100 {
-            assert!(heap.insert_tuple(&db, &[1u8; 100]).is_ok());
+            assert!(heap.insert_tuple(&db, data).is_ok());
         }
+        let mut iter = heap.begin_scan(&db).unwrap();
+
+        let mut count = 0;
+        while iter.next(&db, ScanDirection::Forward).unwrap() {
+            assert_eq!(iter.get_data(), Some(data));
+            count += 1;
+        }
+        assert_eq!(count, 100);
+
+        let mut count = 0;
+        while iter.next(&db, ScanDirection::Backward).unwrap() {
+            assert_eq!(iter.get_data(), Some(data));
+            count += 1;
+        }
+        assert_eq!(count, 100);
         assert!(db_dir.close().is_ok());
     }
 }
