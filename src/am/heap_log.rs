@@ -22,7 +22,7 @@ impl<'a> HeapLogRecord<'a> {
         heap_id: OID,
         page_num: usize,
         offset: usize,
-        tuple_data: & [u8],
+        tuple_data: &[u8],
     ) -> LogRecord {
         let heap_insert_record = HeapInsertLog {
             heap_id,

@@ -12,7 +12,7 @@ use super::{
     HeapLogRecord,
 };
 
-use std::sync::Mutex;
+use std::{borrow::Cow, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,27 +21,36 @@ fn tuple_size_limit() -> usize {
 }
 
 #[derive(Serialize, Deserialize)]
-struct HeapTuple {
+struct HeapTuple<'a> {
     #[serde(skip)]
     table_id: OID,
     #[serde(skip)]
     ptr: Option<ItemPointer>,
-    // TODO: use Cow to avoid copying
-    #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
+    #[serde(borrow)]
+    data: Cow<'a, [u8]>,
 }
 
-impl HeapTuple {
-    pub fn new(table_id: OID, data: &[u8]) -> Self {
+impl<'a> HeapTuple<'a> {
+    pub fn new(table_id: OID, data: &'a [u8]) -> Self {
         Self {
             table_id,
             ptr: None,
-            data: data.to_vec(),
+            data: data.into(),
         }
     }
 
     pub fn set_pointer(&mut self, ptr: ItemPointer) {
         self.ptr = Some(ptr);
+    }
+
+    pub fn materialize(&self) -> Self {
+        let mut tuple = Self {
+            table_id: self.table_id,
+            ptr: self.ptr,
+            data: self.data.clone(),
+        };
+        tuple.data.to_mut();
+        tuple
     }
 }
 
@@ -65,8 +74,8 @@ impl Heap {
         }
     }
 
-    fn prepare_heap_tuple_for_insert(&self, data: &[u8]) -> HeapTuple {
-        HeapTuple::new(self.rel_id(), data)
+    fn prepare_heap_tuple_for_insert<'a>(&self, data: &'a [u8]) -> HeapTuple<'a> {
+        HeapTuple::new(self.rel_id(), data).materialize()
     }
 
     fn get_insert_hint(&self) -> Option<usize> {
@@ -251,7 +260,13 @@ impl Heap {
                     match HeapPageView::with_page(page, |page_view| {
                         if remaining_tuples > 0 {
                             let line_ptr = page_view.get_line_pointer(offset);
-                            let htup_buf = page_view.get_item(line_ptr);
+                            let item = page_view.get_item(line_ptr);
+                            let htup_buf = unsafe {
+                                // extend the lifetime of buf to 'a
+                                // this is ok because we keep a pinned page in the scan iterator
+                                // so the page buffer will be valid until the next iteration
+                                std::mem::transmute::<&[u8], &'a [u8]>(item)
+                            };
 
                             let mut htup = match bincode::deserialize::<HeapTuple>(htup_buf) {
                                 Ok(htup) => htup,
@@ -327,7 +342,7 @@ impl Heap {
                                     bufmgr.release_page(page)?;
                                 }
 
-                                iterator.tuple = HeapTuple::new(self.rel_id(), &[]);
+                                iterator.tuple = HeapTuple::new(self.rel_id(), &[]).materialize();
                                 iterator.inited = false;
 
                                 return Ok(false);
@@ -367,7 +382,7 @@ impl Relation for Heap {
 pub struct HeapScanIterator<'a> {
     heap: &'a Heap,
     inited: bool,
-    tuple: HeapTuple,
+    tuple: HeapTuple<'a>,
     cur_page: Option<PinnedPagePtr>,
     cur_page_num: usize,
     num_tuples: usize,
@@ -406,7 +421,7 @@ impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
         if !self.inited {
             None
         } else {
-            Some(&self.tuple.data[..])
+            Some(&self.tuple.data)
         }
     }
 }
@@ -439,7 +454,7 @@ impl Table for Heap {
         let heap_it = HeapScanIterator {
             heap: &self,
             inited: false,
-            tuple: HeapTuple::new(self.rel_id(), &[]),
+            tuple: HeapTuple::new(self.rel_id(), &[]).materialize(),
             cur_page: None,
             cur_page_num: 0,
             num_tuples: 0,
