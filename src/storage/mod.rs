@@ -5,7 +5,7 @@ mod page_cache;
 mod storage_manager;
 mod table;
 
-use crate::{Relation, Result, OID};
+use crate::{wal::LogPointer, Relation, Result, OID};
 
 use std::{
     fmt,
@@ -20,6 +20,8 @@ pub use self::{
     storage_manager::{ForkType, StorageHandle, StorageManager},
     table::{ScanDirection, Table, TableData, TablePtr, TableScanIterator},
 };
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct RelFileRef {
@@ -197,5 +199,79 @@ impl ItemPointer {
                 offset: self.offset - 1,
             })
         }
+    }
+}
+
+const P_LSN: usize = 0;
+const P_PAYLOAD: usize = P_LSN + 8;
+
+pub trait DiskPageReader {
+    fn get_page_buffer(&self) -> &[u8; PAGE_SIZE];
+
+    fn get_disk_page_payload(&self) -> &[u8] {
+        &self.get_page_buffer()[P_PAYLOAD..]
+    }
+
+    fn get_lsn(&self) -> LogPointer {
+        let buf = self.get_page_buffer();
+        (&buf[P_LSN..]).read_u64::<LittleEndian>().unwrap() as LogPointer
+    }
+}
+
+pub trait DiskPageWriter {
+    fn get_page_buffer_mut(&mut self) -> &mut [u8; PAGE_SIZE];
+
+    fn get_disk_page_payload_mut(&mut self) -> &mut [u8] {
+        &mut self.get_page_buffer_mut()[P_PAYLOAD..]
+    }
+
+    fn set_lsn(&mut self, lsn: LogPointer) {
+        (&mut self.get_page_buffer_mut()[P_LSN..])
+            .write_u64::<LittleEndian>(lsn as u64)
+            .unwrap();
+    }
+}
+
+pub struct DiskPageView<'a> {
+    buffer: &'a [u8; PAGE_SIZE],
+}
+
+impl<'a> DiskPageView<'a> {
+    pub fn new(buffer: &'a [u8; PAGE_SIZE]) -> Self {
+        Self { buffer }
+    }
+
+    pub fn with_page<F, R>(page: &PinnedPagePtr, f: F) -> Result<R>
+    where
+        F: Copy + FnOnce(&DiskPageView) -> Result<R>,
+    {
+        page.with_read(|page| {
+            let buffer = page.buffer();
+            let page_view = DiskPageView::new(buffer);
+
+            f(&page_view)
+        })
+    }
+}
+
+impl<'a> DiskPageReader for DiskPageView<'a> {
+    fn get_page_buffer(&self) -> &[u8; PAGE_SIZE] {
+        self.buffer
+    }
+}
+
+pub struct DiskPageViewMut<'a> {
+    buffer: &'a mut [u8; PAGE_SIZE],
+}
+
+impl<'a> DiskPageReader for DiskPageViewMut<'a> {
+    fn get_page_buffer(&self) -> &[u8; PAGE_SIZE] {
+        self.buffer
+    }
+}
+
+impl<'a> DiskPageWriter for DiskPageViewMut<'a> {
+    fn get_page_buffer_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        self.buffer
     }
 }

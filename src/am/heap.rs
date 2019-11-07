@@ -1,8 +1,8 @@
 use crate::{
     catalog::Schema,
     storage::{
-        consts::PAGE_SIZE, ForkType, ItemPointer, PinnedPagePtr, RelationWithStorage,
-        ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
+        consts::PAGE_SIZE, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
+        RelationWithStorage, ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
@@ -304,11 +304,11 @@ impl Heap {
                                     finished = iterator.cur_page_num == iterator.start_page;
 
                                     if let Some(limit) = &mut iterator.max_pages {
-                                            if *limit == 0 {
-                                                finished = true;
-                                            } else {
-                                                *limit -= 1;
-                                            }
+                                        if *limit == 0 {
+                                            finished = true;
+                                        } else {
+                                            *limit -= 1;
+                                        }
                                     }
 
                                     next_page = if iterator.cur_page_num > 0 {
@@ -324,7 +324,7 @@ impl Heap {
                                 let page = iterator.cur_page.take();
 
                                 if let Some(page) = page {
-                                        bufmgr.release_page(page)?;
+                                    bufmgr.release_page(page)?;
                                 }
 
                                 iterator.tuple = HeapTuple::new(self.rel_id(), &[]);
@@ -382,7 +382,7 @@ impl<'a> HeapScanIterator<'a> {
 
         let old_page = self.cur_page.take();
         if let Some(page) = old_page {
-                bufmgr.release_page(page)?;
+            bufmgr.release_page(page)?;
         }
 
         let page = bufmgr.fetch_page(shandle, ForkType::Main, page_num)?;
@@ -402,7 +402,7 @@ impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
         self.heap.get_next_tuple(db, self, dir)
     }
 
-    fn get_data(& self) -> Option<& [u8]> {
+    fn get_data(&self) -> Option<&[u8]> {
         if !self.inited {
             None
         } else {
