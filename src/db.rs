@@ -38,6 +38,11 @@ impl DB {
     pub fn get_buffer_manager(&self) -> &BufferManager {
         &self.bufmgr
     }
+
+    pub fn get_wal(&self) -> &Wal {
+        &self.wal
+    }
+
     pub fn create_table(&self, db: OID, rel_id: OID, schema: Schema) -> Result<TablePtr> {
         let heap = Arc::new(Heap::new(rel_id, db, schema));
         heap.create_storage(&self.smgr)?;

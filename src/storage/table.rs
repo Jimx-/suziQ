@@ -21,7 +21,7 @@ pub enum ScanDirection {
 pub trait TableScanIterator<'a> {
     fn next(&mut self, db: &DB, dir: ScanDirection) -> Result<bool>;
 
-    fn get_data<'b>(&'b self) -> Option<&'b [u8]>;
+    fn get_data(&self) -> Option<&[u8]>;
 }
 
 pub trait Table: Relation {

@@ -3,6 +3,7 @@ use crate::*;
 
 use std::{collections::HashMap, option::Option, sync::RwLock};
 
+#[derive(Default)]
 pub struct CatalogCache {
     table_cache: RwLock<HashMap<OID, TablePtr>>,
 }

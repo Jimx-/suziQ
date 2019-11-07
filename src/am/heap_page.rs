@@ -2,10 +2,12 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::{
     storage::{consts::PAGE_SIZE, PinnedPagePtr},
+    wal::LogPointer,
     Error, Result,
 };
 
-const P_LOWER: usize = 0;
+const P_LSN: usize = 0;
+const P_LOWER: usize = 8;
 const P_UPPER: usize = P_LOWER + 2;
 const P_POINTERS: usize = P_UPPER + 2;
 
@@ -30,6 +32,10 @@ pub trait HeapPageReader {
         (&buf[P_UPPER..]).read_u16::<LittleEndian>().unwrap()
     }
 
+    fn get_lsn(&self) -> LogPointer {
+        let buf = self.get_page_buffer();
+        (&buf[P_LSN..]).read_u64::<LittleEndian>().unwrap() as LogPointer
+    }
     fn is_new(&self) -> bool {
         self.get_upper() == 0
     }
@@ -66,7 +72,7 @@ pub trait HeapPageReader {
         LinePointer { off, len }
     }
 
-    fn get_item<'a>(&'a self, line_ptr: LinePointer) -> &'a [u8] {
+    fn get_item(&self, line_ptr: LinePointer) -> &[u8] {
         let buf = self.get_page_buffer();
         let LinePointer { off, len } = line_ptr;
         &buf[off as usize..(off + len) as usize]
@@ -122,6 +128,11 @@ impl<'a> HeapPageViewMut<'a> {
             .unwrap();
     }
 
+    pub fn set_lsn(&mut self, lsn: LogPointer) {
+        (&mut self.buffer[P_LSN..])
+            .write_u64::<LittleEndian>(lsn as u64)
+            .unwrap();
+    }
     pub fn init_page(&mut self) {
         for i in self.buffer.iter_mut() {
             *i = 0;
@@ -131,7 +142,7 @@ impl<'a> HeapPageViewMut<'a> {
         self.set_upper(PAGE_SIZE as u16);
     }
 
-    fn put_line_pointer(&mut self, offset: usize, lp: &LinePointer) {
+    fn put_line_pointer(&mut self, offset: usize, lp: LinePointer) {
         (&mut self.buffer[P_POINTERS + offset * LINE_POINTER_SIZE..])
             .write_u16::<LittleEndian>(lp.off)
             .unwrap();
@@ -158,7 +169,7 @@ impl<'a> HeapPageViewMut<'a> {
         };
 
         let offset = self.num_line_pointers();
-        self.put_line_pointer(offset, &lp);
+        self.put_line_pointer(offset, lp);
         lower += LINE_POINTER_SIZE as u16;
 
         (&mut self.buffer[upper as usize..upper as usize + tuple.len()]).copy_from_slice(tuple);

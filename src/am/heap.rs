@@ -7,7 +7,10 @@ use crate::{
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
 
-use super::heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut};
+use super::{
+    heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut},
+    HeapLogRecord,
+};
 
 use std::sync::Mutex;
 
@@ -23,6 +26,7 @@ struct HeapTuple {
     table_id: OID,
     #[serde(skip)]
     ptr: Option<ItemPointer>,
+    // TODO: use Cow to avoid copying
     #[serde(with = "serde_bytes")]
     data: Vec<u8>,
 }
@@ -67,7 +71,7 @@ impl Heap {
 
     fn get_insert_hint(&self) -> Option<usize> {
         let guard = self.insert_hint.lock().unwrap();
-        guard.clone()
+        *guard
     }
 
     fn set_insert_hint(&self, hint: usize) {
@@ -100,11 +104,10 @@ impl Heap {
             let result = page_ptr.with_write(move |page| {
                 let buffer = page.buffer_mut();
                 let mut page_view = HeapPageViewMut::new(buffer);
-                let mut dirty = false;
+                let mut dirty = page_view.is_new();
 
                 if page_view.is_new() {
                     page_view.init_page();
-                    dirty = true;
                 }
 
                 let free_space = page_view.get_free_space();
@@ -289,29 +292,23 @@ impl Heap {
 
                                     finished = next_page == iterator.start_page;
 
-                                    match &mut iterator.max_pages {
-                                        Some(limit) => {
-                                            if *limit == 0 {
-                                                finished = true;
-                                            } else {
-                                                *limit -= 1;
-                                            }
+                                    if let Some(limit) = &mut iterator.max_pages {
+                                        if *limit == 0 {
+                                            finished = true;
+                                        } else {
+                                            *limit -= 1;
                                         }
-                                        _ => {}
                                     }
                                 }
                                 ScanDirection::Backward => {
                                     finished = iterator.cur_page_num == iterator.start_page;
 
-                                    match &mut iterator.max_pages {
-                                        Some(limit) => {
+                                    if let Some(limit) = &mut iterator.max_pages {
                                             if *limit == 0 {
                                                 finished = true;
                                             } else {
                                                 *limit -= 1;
                                             }
-                                        }
-                                        _ => {}
                                     }
 
                                     next_page = if iterator.cur_page_num > 0 {
@@ -326,11 +323,8 @@ impl Heap {
                                 // no more pages
                                 let page = iterator.cur_page.take();
 
-                                match page {
-                                    Some(page) => {
+                                if let Some(page) = page {
                                         bufmgr.release_page(page)?;
-                                    }
-                                    _ => {}
                                 }
 
                                 iterator.tuple = HeapTuple::new(self.rel_id(), &[]);
@@ -387,11 +381,8 @@ impl<'a> HeapScanIterator<'a> {
         let bufmgr = db.get_buffer_manager();
 
         let old_page = self.cur_page.take();
-        match old_page {
-            Some(page) => {
+        if let Some(page) = old_page {
                 bufmgr.release_page(page)?;
-            }
-            _ => {}
         }
 
         let page = bufmgr.fetch_page(shandle, ForkType::Main, page_num)?;
@@ -411,7 +402,7 @@ impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
         self.heap.get_next_tuple(db, self, dir)
     }
 
-    fn get_data<'b>(&'b self) -> Option<&'b [u8]> {
+    fn get_data(& self) -> Option<& [u8]> {
         if !self.inited {
             None
         } else {
@@ -432,6 +423,11 @@ impl Table for Heap {
 
         let itemp = self.with_page_for_tuple(db, htup_len, |page_view, page_num| {
             let off = page_view.put_tuple(&htup_buf)?;
+            // create insert log
+            let insert_log =
+                HeapLogRecord::create_heap_insert_log(self.rel_id(), page_num, off, &htup_buf);
+            let lsn = db.get_wal().append(&insert_log)?;
+            page_view.set_lsn(lsn);
             Ok((ItemPointer::new(page_num, off), true))
         })?;
         Ok(itemp)

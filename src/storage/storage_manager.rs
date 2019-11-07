@@ -10,7 +10,9 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ForkType {
     Main = 0,
     Last = 1,
