@@ -12,7 +12,7 @@ pub fn get_temp_smgr() -> (StorageManager, tempfile::TempDir) {
 pub fn get_temp_db() -> (DB, tempfile::TempDir) {
     let db_dir = tempfile::tempdir().unwrap();
     let config = DBConfig::new().root_path(&db_dir.path());
-    let db = DB::new(config);
+    let db = DB::open(&config).unwrap();
 
     (db, db_dir)
 }

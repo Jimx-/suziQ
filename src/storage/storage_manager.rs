@@ -220,7 +220,10 @@ impl StorageManager {
 
                 *guard_ref = Some(file);
 
-                f(guard_ref.as_mut().expect("impossbile"))
+                match guard_ref.as_mut() {
+                    Some(file) => f(file),
+                    _ => unreachable!(),
+                }
             }
         }
     }

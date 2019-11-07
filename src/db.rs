@@ -6,6 +6,7 @@ use crate::{
     am::Heap,
     catalog::{CatalogCache, Schema},
     storage::{BufferManager, RelationWithStorage, StorageManager, TablePtr},
+    wal::Wal,
     Result,
 };
 
@@ -13,18 +14,21 @@ pub struct DB {
     bufmgr: BufferManager,
     smgr: Rc<StorageManager>,
     catalog_cache: CatalogCache,
+    wal: Wal,
 }
 
 impl DB {
-    pub fn new(config: DBConfig) -> Self {
+    pub fn open(config: &DBConfig) -> Result<Self> {
         let smgr = Rc::new(StorageManager::new(config.get_storage_path()));
         let bufmgr = BufferManager::new(smgr.clone(), config.cache_capacity);
         let catalog_cache = CatalogCache::new();
-        Self {
-            bufmgr: bufmgr,
-            smgr: smgr,
+        let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
+        Ok(Self {
+            bufmgr,
+            smgr,
             catalog_cache,
-        }
+            wal,
+        })
     }
 
     pub fn get_storage_manager(&self) -> &StorageManager {

@@ -14,6 +14,7 @@ pub enum Error {
     DataCorrupted(String),
     ProgramLimitExceed(String),
     InvalidState(String),
+    InvalidArgument(String),
     OutOfMemory,
 }
 
