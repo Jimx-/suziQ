@@ -18,10 +18,14 @@ pub enum ScanDirection {
     Backward,
 }
 
-pub trait TableScanIterator<'a> {
-    fn next(&mut self, db: &DB, dir: ScanDirection) -> Result<bool>;
+pub trait Tuple {
+    fn get_data(&self) -> &[u8];
+    /// Materialize the tuple so that it does not depend on any underlying resource
+    fn materialize<'ret>(self: Box<Self>) -> Box<dyn Tuple + 'ret>;
+}
 
-    fn get_data(&self) -> Option<&[u8]>;
+pub trait TableScanIterator<'a> {
+    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<Box<dyn Tuple + 'a>>>;
 }
 
 pub trait Table: Relation {

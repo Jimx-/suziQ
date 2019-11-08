@@ -1,8 +1,9 @@
 use crate::{
     catalog::Schema,
     storage::{
-        consts::PAGE_SIZE, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
+        consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
         RelationWithStorage, ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
+        Tuple,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
@@ -20,7 +21,7 @@ fn tuple_size_limit() -> usize {
     PAGE_SIZE
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct HeapTuple<'a> {
     #[serde(skip)]
     table_id: OID,
@@ -31,7 +32,7 @@ struct HeapTuple<'a> {
 }
 
 impl<'a> HeapTuple<'a> {
-    pub fn new(table_id: OID, data: &'a [u8]) -> Self {
+    fn new(table_id: OID, data: &'a [u8]) -> Self {
         Self {
             table_id,
             ptr: None,
@@ -39,18 +40,51 @@ impl<'a> HeapTuple<'a> {
         }
     }
 
-    pub fn set_pointer(&mut self, ptr: ItemPointer) {
+    fn set_pointer(&mut self, ptr: ItemPointer) {
         self.ptr = Some(ptr);
     }
 
-    pub fn materialize(&self) -> Self {
-        let mut tuple = Self {
+    fn materialize<'b>(&self) -> HeapTuple<'b> {
+        HeapTuple {
             table_id: self.table_id,
             ptr: self.ptr,
-            data: self.data.clone(),
+            data: Cow::from(self.data.to_vec()),
+        }
+    }
+}
+
+struct BufferHeapTuple<'a> {
+    tuple: HeapTuple<'a>,
+    bufmgr: Option<&'a BufferManager>,
+    page: Option<PinnedPagePtr>,
+}
+
+impl<'a> Tuple for BufferHeapTuple<'a> {
+    fn get_data(&self) -> &[u8] {
+        &self.tuple.data
+    }
+    fn materialize<'ret>(self: Box<Self>) -> Box<dyn Tuple + 'ret> {
+        let tuple = BufferHeapTuple {
+            tuple: self.tuple.materialize(),
+            bufmgr: None,
+            page: None,
         };
-        tuple.data.to_mut();
-        tuple
+
+        Box::new(tuple)
+    }
+}
+
+impl<'a> Drop for BufferHeapTuple<'a> {
+    fn drop(&mut self) {
+        let bufmgr = self.bufmgr.take();
+        let page = self.page.take();
+        match (bufmgr, page) {
+            (Some(bufmgr), Some(page)) => {
+                bufmgr.release_page(page).unwrap();
+            }
+            (None, None) => {}
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -413,15 +447,16 @@ impl<'a> HeapScanIterator<'a> {
 }
 
 impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
-    fn next(&mut self, db: &DB, dir: ScanDirection) -> Result<bool> {
-        self.heap.get_next_tuple(db, self, dir)
-    }
-
-    fn get_data(&self) -> Option<&[u8]> {
-        if !self.inited {
-            None
+    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<Box<dyn Tuple + 'a>>> {
+        if self.heap.get_next_tuple(db, self, dir)? {
+            let buffer_tuple = BufferHeapTuple {
+                tuple: self.tuple.clone(),
+                bufmgr: Some(db.get_buffer_manager()),
+                page: self.cur_page.clone(),
+            };
+            Ok(Some(Box::new(buffer_tuple)))
         } else {
-            Some(&self.tuple.data)
+            Ok(None)
         }
     }
 }
@@ -503,18 +538,19 @@ mod tests {
         let mut iter = heap.begin_scan(&db).unwrap();
 
         let mut count = 0;
-        while iter.next(&db, ScanDirection::Forward).unwrap() {
-            assert_eq!(iter.get_data(), Some(data));
+        while let Some(tuple) = iter.next(&db, ScanDirection::Forward).unwrap() {
+            assert_eq!(tuple.get_data(), data);
             count += 1;
         }
         assert_eq!(count, 100);
 
         let mut count = 0;
-        while iter.next(&db, ScanDirection::Backward).unwrap() {
-            assert_eq!(iter.get_data(), Some(data));
+        while let Some(tuple) = iter.next(&db, ScanDirection::Backward).unwrap() {
+            assert_eq!(tuple.get_data(), data);
             count += 1;
         }
         assert_eq!(count, 100);
+
         assert!(db_dir.close().is_ok());
     }
 }
