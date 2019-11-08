@@ -15,6 +15,7 @@ extern crate tempfile;
 
 mod config;
 mod db;
+mod ffi;
 mod relation;
 mod result;
 mod test_util;
