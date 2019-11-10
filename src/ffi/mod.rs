@@ -1,6 +1,10 @@
 extern crate libc;
 
-use crate::{catalog::Schema, storage::TablePtr, DBConfig, Error, DB, OID};
+use crate::{
+    catalog::Schema,
+    storage::{ScanDirection, TablePtr, TableScanIterator, Tuple},
+    DBConfig, Error, DB, OID,
+};
 
 use libc::{c_char, c_int};
 use std::{cell::RefCell, ffi::CStr, path::PathBuf, sync::Arc};
@@ -139,4 +143,125 @@ pub extern "C" fn sq_table_insert_tuple(
             0
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_table_begin_scan<'a>(
+    table: *const TablePtr,
+    db: *const DB,
+) -> *mut Box<dyn TableScanIterator<'a> + 'a> {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let table: &TablePtr = unsafe {
+        assert!(!table.is_null());
+        &*table
+    };
+
+    let iterator = match table.begin_scan(db) {
+        Ok(iterator) => iterator,
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(iterator))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_table_scan_iterator<'a>(
+    iterator: *mut Box<dyn TableScanIterator<'a> + 'a>,
+) {
+    if iterator.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(iterator);
+    }
+}
+
+fn get_scan_direction(dir: c_int) -> ScanDirection {
+    if dir == 0 {
+        ScanDirection::Forward
+    } else {
+        ScanDirection::Backward
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_table_scan_next<'a>(
+    iterator: *mut Box<dyn TableScanIterator<'a> + 'a>,
+    db: *const DB,
+    dir: c_int,
+) -> *const Box<dyn Tuple + 'a> {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let iterator: &mut Box<dyn TableScanIterator<'a> + 'a> = unsafe {
+        assert!(!iterator.is_null());
+        &mut *iterator
+    };
+
+    let tuple = match iterator.next(db, get_scan_direction(dir)) {
+        Ok(Some(tuple)) => tuple.materialize(),
+        Ok(None) => {
+            return std::ptr::null();
+        }
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null();
+        }
+    };
+
+    Box::into_raw(Box::new(tuple))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_tuple<'a>(tuple: *const Box<dyn Tuple + 'a>) {
+    if tuple.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(tuple as *mut Box<dyn Tuple + 'a>);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_tuple_get_data_len<'a>(tuple: *const Box<dyn Tuple + 'a>) -> c_int {
+    let tuple = unsafe {
+        assert!(!tuple.is_null());
+        &*tuple
+    };
+
+    tuple.get_data().len() as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sq_tuple_get_data<'a>(
+    tuple: *const Box<dyn Tuple + 'a>,
+    buffer: *mut c_char,
+    length: c_int,
+) -> c_int {
+    if buffer.is_null() {
+        return -1;
+    }
+
+    let tuple = {
+        assert!(!tuple.is_null());
+        &*tuple
+    };
+
+    let data = tuple.get_data();
+    let buffer = std::slice::from_raw_parts_mut(buffer as *mut u8, length as usize);
+
+    if data.len() > buffer.len() {
+        return -1;
+    }
+
+    std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.as_mut_ptr(), data.len());
+
+    data.len() as c_int
 }
