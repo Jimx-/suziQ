@@ -49,7 +49,8 @@ impl DB {
         self.catalog_cache.add_table(heap.clone());
         Ok(heap)
     }
-    fn _open_table(&self, rel_id: OID) -> Option<TablePtr> {
+
+    pub fn open_table(&self, rel_id: OID) -> Option<TablePtr> {
         self.catalog_cache.lookup_table(rel_id)
     }
 }

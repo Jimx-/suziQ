@@ -109,6 +109,23 @@ pub extern "C" fn sq_create_table(db: *const DB, db_oid: OID, rel_oid: OID) -> *
 }
 
 #[no_mangle]
+pub extern "C" fn sq_open_table(db: *const DB, rel_oid: OID) -> *const TablePtr {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let table = match db.open_table(rel_oid) {
+        Some(table) => table,
+        _ => {
+            return std::ptr::null();
+        }
+    };
+
+    Box::into_raw(Box::new(table))
+}
+
+#[no_mangle]
 pub extern "C" fn sq_free_table(table: *const TablePtr) {
     if table.is_null() {
         return;
