@@ -122,6 +122,12 @@ impl Wal {
             _ => unreachable!(),
         }
     }
+
+    pub fn flush(&self) -> Result<()> {
+        let mut guard = self.open_segment.lock().unwrap();
+
+        guard.flush_page(false)
+    }
 }
 
 fn filename_to_segno(filename: &str) -> Result<u32> {

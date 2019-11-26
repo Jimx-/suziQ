@@ -1,11 +1,13 @@
 pub mod am;
 pub mod catalog;
+pub mod concurrency;
 pub mod storage;
 pub mod wal;
 
 extern crate bincode;
 extern crate byteorder;
 extern crate fs2;
+extern crate log;
 extern crate lru;
 extern crate serde;
 extern crate serde_bytes;

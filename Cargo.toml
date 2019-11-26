@@ -16,6 +16,7 @@ byteorder = "1.2"
 crc = "1"
 fs2 = "0.4.3"
 libc = "*"
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

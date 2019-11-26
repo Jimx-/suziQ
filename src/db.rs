@@ -5,6 +5,7 @@ use std::{option::Option, rc::Rc, sync::Arc};
 use crate::{
     am::Heap,
     catalog::{CatalogCache, Schema},
+    concurrency::{Transaction, TransactionManager},
     storage::{BufferManager, RelationWithStorage, StorageManager, TablePtr},
     wal::Wal,
     Result,
@@ -14,6 +15,7 @@ pub struct DB {
     bufmgr: BufferManager,
     smgr: Rc<StorageManager>,
     catalog_cache: CatalogCache,
+    txnmgr: TransactionManager,
     wal: Wal,
 }
 
@@ -22,11 +24,13 @@ impl DB {
         let smgr = Rc::new(StorageManager::new(config.get_storage_path()));
         let bufmgr = BufferManager::new(smgr.clone(), config.cache_capacity);
         let catalog_cache = CatalogCache::new();
+        let txnmgr = TransactionManager::new();
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
         Ok(Self {
             bufmgr,
             smgr,
             catalog_cache,
+            txnmgr,
             wal,
         })
     }
@@ -52,5 +56,13 @@ impl DB {
 
     pub fn open_table(&self, rel_id: OID) -> Option<TablePtr> {
         self.catalog_cache.lookup_table(rel_id)
+    }
+
+    pub fn start_transaction(&self) -> Result<Transaction> {
+        self.txnmgr.start_transaction()
+    }
+
+    pub fn commit_transaction(&self, txn: Transaction) -> Result<()> {
+        self.txnmgr.commit_transaction(self, txn)
     }
 }

@@ -118,15 +118,20 @@ impl Segment {
     where
         T: Deref<Target = [u8]>,
     {
-        match self.page {
+        match &mut self.page {
             None => Err(Error::InvalidState(
                 "log segment is not writable".to_owned(),
             )),
-            Some(mut page) => {
+            Some(page) => {
                 let mut length = record.len();
                 let mut offset = 0;
 
-                if !self.sufficient_capacity(record.len()) {
+                if !Self::_sufficient_capacity(
+                    self.page_allocated,
+                    self.page_start,
+                    self.capacity,
+                    record.len(),
+                ) {
                     return Ok(None);
                 }
 
@@ -134,7 +139,16 @@ impl Segment {
 
                 while length > 0 {
                     if SEGMENT_PAGE_SIZE - self.page_allocated <= RECORD_HEADER_SIZE {
-                        self.flush_page(true)?;
+                        self.file
+                            .write_all(&page[self.page_flushed..SEGMENT_PAGE_SIZE])?;
+
+                        for i in page.iter_mut() {
+                            *i = 0;
+                        }
+
+                        self.page_allocated = 0;
+                        self.page_flushed = 0;
+                        self.page_start += SEGMENT_PAGE_SIZE;
                     }
 
                     let chunk_size = std::cmp::min(
@@ -191,11 +205,11 @@ impl Segment {
     }
 
     pub fn flush_page(&mut self, reset: bool) -> Result<()> {
-        match self.page {
+        match &mut self.page {
             None => Err(Error::InvalidState(
                 "log segment is not writable".to_owned(),
             )),
-            Some(mut page) => {
+            Some(page) => {
                 let reset = reset || self.page_allocated + RECORD_HEADER_SIZE >= SEGMENT_PAGE_SIZE;
 
                 if reset {
@@ -224,13 +238,27 @@ impl Segment {
     pub fn segment_start(&self) -> LogPointer {
         ((self.segno as usize - 1) * self.capacity) as LogPointer
     }
+
+    fn _sufficient_capacity(
+        page_allocated: usize,
+        page_start: usize,
+        capacity: usize,
+        record_size: usize,
+    ) -> bool {
+        let mut remaining = SEGMENT_PAGE_SIZE - page_allocated;
+        remaining += (SEGMENT_PAGE_SIZE - RECORD_HEADER_SIZE)
+            * ((capacity - page_start) / SEGMENT_PAGE_SIZE - 1);
+
+        remaining >= record_size
+    }
     pub fn sufficient_capacity(&self, record_size: usize) -> bool {
         self.page.map_or(false, |_| {
-            let mut remaining = SEGMENT_PAGE_SIZE - self.page_allocated;
-            remaining += (SEGMENT_PAGE_SIZE - RECORD_HEADER_SIZE)
-                * ((self.capacity - self.page_start) / SEGMENT_PAGE_SIZE - 1);
-
-            remaining >= record_size
+            Self::_sufficient_capacity(
+                self.page_allocated,
+                self.page_start,
+                self.capacity,
+                record_size,
+            )
         })
     }
 

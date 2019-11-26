@@ -1,5 +1,6 @@
 use crate::{
     catalog::Schema,
+    concurrency::{Transaction, XID},
     storage::{
         consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
         RelationWithStorage, ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
@@ -27,6 +28,9 @@ struct HeapTuple<'a> {
     table_id: OID,
     #[serde(skip)]
     ptr: Option<ItemPointer>,
+
+    min_xid: XID,
+    max_xid: XID,
     #[serde(borrow)]
     data: Cow<'a, [u8]>,
 }
@@ -36,6 +40,8 @@ impl<'a> HeapTuple<'a> {
         Self {
             table_id,
             ptr: None,
+            min_xid: 0,
+            max_xid: 0,
             data: data.into(),
         }
     }
@@ -48,6 +54,8 @@ impl<'a> HeapTuple<'a> {
         HeapTuple {
             table_id: self.table_id,
             ptr: self.ptr,
+            min_xid: self.min_xid,
+            max_xid: self.max_xid,
             data: Cow::from(self.data.to_vec()),
         }
     }
@@ -108,8 +116,15 @@ impl Heap {
         }
     }
 
-    fn prepare_heap_tuple_for_insert<'a>(&self, data: &'a [u8]) -> HeapTuple<'a> {
-        HeapTuple::new(self.rel_id(), data).materialize()
+    fn prepare_heap_tuple_for_insert<'a>(
+        &self,
+        txn: &Transaction,
+        data: &'a [u8],
+    ) -> HeapTuple<'a> {
+        let xid = txn.xid();
+        let mut htup = HeapTuple::new(self.rel_id(), data).materialize();
+        htup.min_xid = xid;
+        htup
     }
 
     fn get_insert_hint(&self) -> Option<usize> {
@@ -466,8 +481,8 @@ impl Table for Heap {
         &self.table_data
     }
 
-    fn insert_tuple(&self, db: &DB, tuple: &[u8]) -> Result<ItemPointer> {
-        let htup = self.prepare_heap_tuple_for_insert(tuple);
+    fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer> {
+        let htup = self.prepare_heap_tuple_for_insert(txn, tuple);
         let htup_buf = bincode::serialize(&htup).unwrap();
         let htup_len = htup_buf.len();
 
@@ -529,12 +544,16 @@ mod tests {
     #[test]
     fn can_insert_and_scan_heap() {
         let (db, db_dir) = get_temp_db();
+        let txn = db.start_transaction().unwrap();
         let heap = db.create_table(0, 0, Schema::new()).unwrap();
 
         let data: &[u8] = &[1u8; 100];
         for _ in 0..100 {
-            assert!(heap.insert_tuple(&db, data).is_ok());
+            assert!(heap.insert_tuple(&db, &txn, data).is_ok());
         }
+
+        db.commit_transaction(txn).unwrap();
+
         let mut iter = heap.begin_scan(&db).unwrap();
 
         let mut count = 0;

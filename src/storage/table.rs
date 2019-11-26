@@ -1,4 +1,6 @@
-use crate::{catalog::Schema, storage::ItemPointer, Relation, Result, DB};
+use crate::{
+    catalog::Schema, concurrency::Transaction, storage::ItemPointer, Relation, Result, DB,
+};
 
 use std::sync::Arc;
 
@@ -35,7 +37,7 @@ pub trait Table: Relation {
         &self.get_table_data().schema
     }
 
-    fn insert_tuple(&self, db: &DB, tuple: &[u8]) -> Result<ItemPointer>;
+    fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer>;
 
     fn begin_scan<'a>(&'a self, db: &DB) -> Result<Box<dyn TableScanIterator<'a> + 'a>>;
 }

@@ -2,6 +2,7 @@ extern crate libc;
 
 use crate::{
     catalog::Schema,
+    concurrency::Transaction,
     storage::{ScanDirection, TablePtr, TableScanIterator, Tuple},
     DBConfig, Error, DB, OID,
 };
@@ -79,7 +80,6 @@ pub extern "C" fn sq_create_db(root_path: *const c_char) -> *const DB {
     };
     Arc::into_raw(Arc::new(db))
 }
-
 #[no_mangle]
 pub extern "C" fn sq_free_db(db: *const DB) {
     if db.is_null() {
@@ -87,6 +87,46 @@ pub extern "C" fn sq_free_db(db: *const DB) {
     }
     unsafe {
         Arc::from_raw(db);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_start_transaction(db: *const DB) -> *mut Transaction {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let txn = match db.start_transaction() {
+        Ok(txn) => txn,
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(txn))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_transaction(_txn: *mut Transaction) {}
+
+#[no_mangle]
+pub extern "C" fn sq_commit_transaction(db: *const DB, txn: *mut Transaction) {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let txn = unsafe {
+        assert!(!txn.is_null());
+        Box::from_raw(txn)
+    };
+
+    match db.commit_transaction(*txn) {
+        Ok(_) => {}
+        Err(e) => {
+            update_last_error(e);
+        }
     }
 }
 
@@ -139,6 +179,7 @@ pub extern "C" fn sq_free_table(table: *const TablePtr) {
 pub extern "C" fn sq_table_insert_tuple(
     table: *const TablePtr,
     db: *const DB,
+    txn: *const Transaction,
     data: *const u8,
     len: u64,
 ) -> c_int {
@@ -150,10 +191,14 @@ pub extern "C" fn sq_table_insert_tuple(
         assert!(!table.is_null());
         &*table
     };
+    let txn: &Transaction = unsafe {
+        assert!(!txn.is_null());
+        &*txn
+    };
 
     let tuple = unsafe { std::slice::from_raw_parts(data, len as usize) };
 
-    match table.insert_tuple(db, tuple) {
+    match table.insert_tuple(db, txn, tuple) {
         Ok(_) => 1,
         Err(e) => {
             update_last_error(e);
