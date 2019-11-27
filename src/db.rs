@@ -3,7 +3,7 @@ use crate::*;
 use std::{option::Option, rc::Rc, sync::Arc};
 
 use crate::{
-    am::Heap,
+    am::heap::Heap,
     catalog::{CatalogCache, Schema},
     concurrency::{Transaction, TransactionManager},
     storage::{BufferManager, RelationWithStorage, StorageManager, TablePtr},

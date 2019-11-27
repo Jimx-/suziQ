@@ -161,7 +161,6 @@ pub trait RelationWithStorage: Relation {
     }
 }
 
-#[derive(Clone)]
 pub struct PinnedPagePtr(PagePtr);
 
 impl Deref for PinnedPagePtr {
@@ -169,6 +168,14 @@ impl Deref for PinnedPagePtr {
 
     fn deref(&self) -> &PagePtr {
         &self.0
+    }
+}
+
+impl Clone for PinnedPagePtr {
+    fn clone(&self) -> Self {
+        let page_ptr = self.0.clone();
+        let (_, page) = page_ptr.pin().unwrap();
+        page
     }
 }
 

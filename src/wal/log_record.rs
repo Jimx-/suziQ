@@ -1,4 +1,4 @@
-use crate::{am::HeapLogRecord, concurrency::TransactionLogRecord};
+use crate::{am::heap::HeapLogRecord, concurrency::TransactionLogRecord};
 
 use serde::{Deserialize, Serialize};
 

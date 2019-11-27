@@ -1,3 +1,6 @@
+mod heap_log;
+mod heap_page;
+
 use crate::{
     catalog::Schema,
     concurrency::{Transaction, XID},
@@ -9,10 +12,9 @@ use crate::{
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
 
-use super::{
-    heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut},
-    HeapLogRecord,
-};
+use self::heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut};
+
+pub(crate) use self::heap_log::HeapLogRecord;
 
 use std::{borrow::Cow, sync::Mutex};
 

@@ -109,6 +109,7 @@ impl PageCache {
     pub fn release_page(&mut self, page_ptr: PinnedPagePtr) -> Result<()> {
         page_ptr.with_write(|page| {
             let pin_count = page.unpin();
+            println!("pin_count: {}", pin_count);
             let (file_ref, fork, page_num) = page.get_fork_and_num();
             let slot = page.slot();
 
