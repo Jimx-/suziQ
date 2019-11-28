@@ -197,9 +197,7 @@ impl Segment {
                     offset += chunk_size;
                 }
 
-                Ok(Some(
-                    self.segment_start() + (self.page_start + self.page_allocated) as LogPointer,
-                ))
+                Ok(Some(self.current_lsn()))
             }
         }
     }
@@ -239,6 +237,13 @@ impl Segment {
         ((self.segno as usize - 1) * self.capacity) as LogPointer
     }
 
+    pub fn current_lsn(&self) -> LogPointer {
+        self.segment_start() + (self.page_start + self.page_allocated) as LogPointer
+    }
+
+    pub fn flushed_lsn(&self) -> LogPointer {
+        self.segment_start() + (self.page_start + self.page_flushed) as LogPointer
+    }
     fn _sufficient_capacity(
         page_allocated: usize,
         page_start: usize,

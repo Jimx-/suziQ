@@ -58,6 +58,9 @@ impl Page {
         self.pin_count
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
     pub fn set_dirty(&mut self, dirty: bool) {
         self.dirty = dirty;
     }
@@ -128,6 +131,15 @@ impl PagePtr {
     pub(self) fn pin(self) -> Result<(i32, PinnedPagePtr)> {
         let pin_count = self.with_write(|page| Ok(page.pin()))?;
         Ok((pin_count, PinnedPagePtr(self)))
+    }
+
+    pub(self) fn pin_if<F>(self, f: F) -> Result<Option<(i32, PinnedPagePtr)>>
+    where
+        F: FnOnce(&Page) -> bool,
+    {
+        let pin_count =
+            self.with_write(|page| Ok(if f(page) { Some(page.pin()) } else { None }))?;
+        Ok(pin_count.map(|pin_count| (pin_count, PinnedPagePtr(self))))
     }
 }
 

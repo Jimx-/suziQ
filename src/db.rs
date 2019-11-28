@@ -1,37 +1,43 @@
 use crate::*;
 
-use std::{option::Option, rc::Rc, sync::Arc};
+use std::{
+    option::Option,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     am::heap::Heap,
     catalog::{CatalogCache, Schema},
     concurrency::{Transaction, TransactionManager},
     storage::{BufferManager, RelationWithStorage, StorageManager, TablePtr},
-    wal::Wal,
+    wal::{CheckpointManager, Wal},
     Result,
 };
 
 pub struct DB {
     bufmgr: BufferManager,
-    smgr: Rc<StorageManager>,
+    smgr: StorageManager,
     catalog_cache: CatalogCache,
     txnmgr: TransactionManager,
     wal: Wal,
+    ckptmgr: Mutex<CheckpointManager>,
 }
 
 impl DB {
     pub fn open(config: &DBConfig) -> Result<Self> {
-        let smgr = Rc::new(StorageManager::new(config.get_storage_path()));
-        let bufmgr = BufferManager::new(smgr.clone(), config.cache_capacity);
+        let smgr = StorageManager::new(config.get_storage_path());
+        let bufmgr = BufferManager::new(config.cache_capacity);
         let catalog_cache = CatalogCache::new();
         let txnmgr = TransactionManager::new();
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
+        let ckptmgr = CheckpointManager::open(config.get_master_record_path())?;
         Ok(Self {
             bufmgr,
             smgr,
             catalog_cache,
             txnmgr,
             wal,
+            ckptmgr: Mutex::new(ckptmgr),
         })
     }
 
@@ -64,5 +70,11 @@ impl DB {
 
     pub fn commit_transaction(&self, txn: Transaction) -> Result<()> {
         self.txnmgr.commit_transaction(self, txn)
+    }
+
+    pub fn create_checkpoint(&self) -> Result<()> {
+        let mut guard = self.ckptmgr.lock().unwrap();
+
+        guard.create_checkpoint(self)
     }
 }

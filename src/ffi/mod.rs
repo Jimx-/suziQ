@@ -1,3 +1,4 @@
+extern crate env_logger;
 extern crate libc;
 
 use crate::{
@@ -9,6 +10,11 @@ use crate::{
 
 use libc::{c_char, c_int};
 use std::{cell::RefCell, ffi::CStr, path::PathBuf, sync::Arc};
+
+#[no_mangle]
+pub unsafe extern "C" fn sq_init() {
+    env_logger::init();
+}
 
 // error handling code borrowed from https://michael-f-bryan.github.io/rust-ffi-guide/errors/return_types.html
 thread_local! {
@@ -326,4 +332,19 @@ pub unsafe extern "C" fn sq_tuple_get_data<'a>(
     std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.as_mut_ptr(), data.len());
 
     data.len() as c_int
+}
+
+#[no_mangle]
+pub extern "C" fn sq_create_checkpoint(db: *const DB) {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    match db.create_checkpoint() {
+        Ok(_) => {}
+        Err(e) => {
+            update_last_error(e);
+        }
+    };
 }

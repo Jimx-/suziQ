@@ -1,7 +1,11 @@
+mod checkpoint_manager;
 mod log_record;
 mod segment;
+mod wal_log;
 
-pub use self::log_record::LogRecord;
+pub use self::{
+    checkpoint_manager::CheckpointManager, log_record::LogRecord, wal_log::WalLogRecord,
+};
 
 use self::segment::Segment;
 
@@ -11,7 +15,7 @@ use std::{
     fs::{self, DirBuilder, File},
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
 };
 
 use fs2::FileExt;
@@ -40,7 +44,7 @@ pub struct Wal {
     #[allow(dead_code)]
     dir: File,
     segment_creator: Mutex<SegmentCreator>,
-    open_segment: Mutex<Segment>,
+    open_segment: RwLock<Segment>,
 }
 
 impl Wal {
@@ -93,7 +97,7 @@ impl Wal {
         Ok(Wal {
             dir,
             segment_creator: Mutex::new(segment_creator),
-            open_segment: Mutex::new(segment),
+            open_segment: RwLock::new(segment),
         })
     }
 
@@ -106,7 +110,7 @@ impl Wal {
     where
         T: Deref<Target = [u8]>,
     {
-        let mut guard = self.open_segment.lock().unwrap();
+        let mut guard = self.open_segment.write().unwrap();
 
         if !guard.sufficient_capacity(record.len()) {
             if guard.dirty() {
@@ -123,10 +127,21 @@ impl Wal {
         }
     }
 
-    pub fn flush(&self) -> Result<()> {
-        let mut guard = self.open_segment.lock().unwrap();
+    pub fn flush(&self, lsn: Option<LogPointer>) -> Result<()> {
+        let mut guard = self.open_segment.write().unwrap();
 
+        if let Some(lsn) = lsn {
+            if guard.flushed_lsn() >= lsn {
+                return Ok(());
+            }
+        }
         guard.flush_page(false)
+    }
+
+    pub fn current_lsn(&self) -> LogPointer {
+        let guard = self.open_segment.read().unwrap();
+
+        guard.current_lsn()
     }
 }
 

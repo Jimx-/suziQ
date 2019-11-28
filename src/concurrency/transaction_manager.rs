@@ -28,10 +28,10 @@ impl TransactionManager {
 
         // write txn commit log
         let txn_commit_log = TransactionLogRecord::create_transaction_commit_log(commit_time);
-        wal.append(&txn_commit_log)?;
+        let lsn = wal.append(&txn_commit_log)?;
 
         // flush the log
-        wal.flush()?;
+        wal.flush(Some(lsn))?;
         Ok(())
     }
 

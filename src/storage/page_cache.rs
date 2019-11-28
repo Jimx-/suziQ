@@ -1,5 +1,10 @@
-use crate::storage::*;
-use crate::*;
+use crate::{
+    storage::{
+        DiskPageReader, DiskPageView, ForkType, Page, PagePtr, PinnedPagePtr, RelFileRef,
+        StorageHandle, PAGE_SIZE,
+    },
+    Error, Result, DB,
+};
 
 use lru::LruCache;
 use std::{collections::HashMap, vec::Vec};
@@ -27,7 +32,7 @@ impl PageCache {
     /// Create a new page if the cache is not full. Otherwise select a victim and evict the page
     fn alloc_page(
         &mut self,
-        smgr: &StorageManager,
+        db: &DB,
         rel: RelFileRef,
         fork: ForkType,
         page_num: usize,
@@ -42,9 +47,13 @@ impl PageCache {
 
             Ok(page_ptr)
         } else {
-            match self.evict(smgr) {
+            match self.evict(db) {
                 Some(page_ptr) => {
                     page_ptr.with_write(|page| {
+                        if page.is_dirty() {
+                            Self::flush_page(db, page)?;
+                        }
+
                         page.set_fork_and_num(tag.0, tag.1, tag.2);
                         self.page_hash.insert(tag, page.slot());
                         Ok(())
@@ -59,15 +68,16 @@ impl PageCache {
 
     pub fn new_page(
         &mut self,
-        smgr: &StorageManager,
+        db: &DB,
         shandle: &StorageHandle,
         rel: RelFileRef,
         fork: ForkType,
     ) -> Result<PinnedPagePtr> {
+        let smgr = db.get_storage_manager();
         let page_num = smgr.file_size_in_page(shandle, fork)?;
         let temp_buf = [0u8; PAGE_SIZE];
         smgr.write(shandle, fork, page_num, &temp_buf)?;
-        let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
+        let page_ptr = self.alloc_page(db, rel, fork, page_num)?;
 
         let (_, pinned_page) = page_ptr.pin()?;
         Ok(pinned_page)
@@ -75,7 +85,7 @@ impl PageCache {
 
     pub fn fetch_page(
         &mut self,
-        smgr: &StorageManager,
+        db: &DB,
         shandle: &StorageHandle,
         rel: RelFileRef,
         fork: ForkType,
@@ -96,7 +106,8 @@ impl PageCache {
                 Ok(pinned_page)
             }
             None => {
-                let page_ptr = self.alloc_page(smgr, rel, fork, page_num)?;
+                let page_ptr = self.alloc_page(db, rel, fork, page_num)?;
+                let smgr = db.get_storage_manager();
                 page_ptr
                     .with_write(|page| smgr.read(shandle, fork, page_num, page.buffer_mut()))?;
                 let (_, pinned_page) = page_ptr.pin()?;
@@ -109,7 +120,6 @@ impl PageCache {
     pub fn release_page(&mut self, page_ptr: PinnedPagePtr) -> Result<()> {
         page_ptr.with_write(|page| {
             let pin_count = page.unpin();
-            println!("pin_count: {}", pin_count);
             let (file_ref, fork, page_num) = page.get_fork_and_num();
             let slot = page.slot();
 
@@ -121,7 +131,30 @@ impl PageCache {
         })
     }
 
-    fn evict(&mut self, _smgr: &StorageManager) -> Option<PagePtr> {
+    pub fn get_dirty_pages(&mut self) -> Vec<PinnedPagePtr> {
+        let lru = &mut self.lru;
+        self.page_pool
+            .iter()
+            .filter_map(|page_ptr| {
+                page_ptr
+                    .clone()
+                    .pin_if(Page::is_dirty)
+                    .unwrap()
+                    .map(|(pin_count, pinned_page)| {
+                        let (rel, fork, num) = pinned_page
+                            .with_read(|page| Ok(page.get_fork_and_num()))
+                            .unwrap();
+                        let tag = PageTag(rel, fork, num);
+                        if pin_count == 1 {
+                            lru.pop(&tag);
+                        }
+
+                        pinned_page
+                    })
+            })
+            .collect()
+    }
+    fn evict(&mut self, _db: &DB) -> Option<PagePtr> {
         match self.lru.pop_lru() {
             Some((tag, victim)) => {
                 let page_ptr = self.page_pool[victim].clone();
@@ -130,5 +163,23 @@ impl PageCache {
             }
             None => None,
         }
+    }
+
+    pub fn flush_page(db: &DB, page: &mut Page) -> Result<()> {
+        let buffer = page.buffer();
+        let page_view = DiskPageView::new(buffer);
+        let lsn = page_view.get_lsn();
+        db.get_wal().flush(Some(lsn))?;
+
+        let smgr = db.get_storage_manager();
+        let (rel, fork, num) = page.get_fork_and_num();
+        let shandle = {
+            let RelFileRef { db, rel_id } = rel;
+            smgr.open(db, rel_id)
+        }?;
+        smgr.write(&shandle, fork, num, buffer)?;
+
+        page.set_dirty(false);
+        Ok(())
     }
 }

@@ -158,7 +158,7 @@ impl Heap {
 
         while let Some(page_num) = target_page_num {
             let page_ptr = self.with_storage(smgr, |storage| {
-                bufmgr.fetch_page(storage, ForkType::Main, page_num)
+                bufmgr.fetch_page(db, storage, ForkType::Main, page_num)
             })?;
 
             let result = page_ptr.with_write(move |page| {
@@ -204,7 +204,7 @@ impl Heap {
 
         // need to extend the heap
         let page_ptr =
-            self.with_storage(smgr, |storage| bufmgr.new_page(storage, ForkType::Main))?;
+            self.with_storage(smgr, |storage| bufmgr.new_page(db, storage, ForkType::Main))?;
 
         let (result, page_num) = page_ptr.with_write(move |page| {
             let (_, _, page_num) = page.get_fork_and_num();
@@ -451,7 +451,7 @@ impl<'a> HeapScanIterator<'a> {
             bufmgr.release_page(page)?;
         }
 
-        let page = bufmgr.fetch_page(shandle, ForkType::Main, page_num)?;
+        let page = bufmgr.fetch_page(db, shandle, ForkType::Main, page_num)?;
         self.cur_page_num = page_num;
 
         self.num_tuples =

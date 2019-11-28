@@ -51,4 +51,10 @@ impl DBConfig {
         path.push("wal");
         path
     }
+
+    pub fn get_master_record_path(&self) -> PathBuf {
+        let mut path = self.root_path.clone();
+        path.push("master_record");
+        path
+    }
 }
