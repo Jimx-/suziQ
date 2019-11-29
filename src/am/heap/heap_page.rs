@@ -142,7 +142,7 @@ impl<'a> HeapPageViewMut<'a> {
             .unwrap();
     }
 
-    pub fn put_tuple(&mut self, tuple: &[u8]) -> Result<usize> {
+    pub fn put_tuple(&mut self, tuple: &[u8], target: Option<usize>) -> Result<usize> {
         let mut lower = self.get_lower();
         let mut upper = self.get_upper();
 
@@ -162,9 +162,21 @@ impl<'a> HeapPageViewMut<'a> {
             len: tuple.len() as u16,
         };
 
-        let offset = self.num_line_pointers();
+        let limit = self.num_line_pointers();
+        let offset = target.unwrap_or(limit);
+
+        if offset > limit {
+            // reject putting items beyond the first unused slot
+            // the insert should be in order even if we are redoing the log records
+            return Err(Error::InvalidArgument(
+                "target offset is too large".to_owned(),
+            ));
+        }
+
         self.put_line_pointer(offset, lp);
-        lower += LINE_POINTER_SIZE as u16;
+        if offset == limit {
+            lower += LINE_POINTER_SIZE as u16;
+        }
 
         (&mut self.get_disk_page_payload_mut()[upper as usize..upper as usize + tuple.len()])
             .copy_from_slice(tuple);

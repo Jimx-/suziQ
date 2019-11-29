@@ -155,15 +155,19 @@ pub extern "C" fn sq_create_table(db: *const DB, db_oid: OID, rel_oid: OID) -> *
 }
 
 #[no_mangle]
-pub extern "C" fn sq_open_table(db: *const DB, rel_oid: OID) -> *const TablePtr {
+pub extern "C" fn sq_open_table(db: *const DB, db_oid: OID, rel_oid: OID) -> *const TablePtr {
     let db = unsafe {
         assert!(!db.is_null());
         &*db
     };
 
-    let table = match db.open_table(rel_oid) {
-        Some(table) => table,
-        _ => {
+    let table = match db.open_table(db_oid, rel_oid) {
+        Ok(Some(table)) => table,
+        Ok(None) => {
+            return std::ptr::null();
+        }
+        Err(e) => {
+            update_last_error(e);
             return std::ptr::null();
         }
     };

@@ -63,14 +63,14 @@ impl BufferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::get_temp_db;
+    use crate::{storage::RelFileRef, test_util::get_temp_db};
 
     #[test]
     fn can_allocate_page() {
         let (db, db_dir) = get_temp_db();
         let smgr = db.get_storage_manager();
         let bufmgr = db.get_buffer_manager();
-        let shandle = smgr.open(0, 0).unwrap();
+        let shandle = smgr.open(RelFileRef { db: 0, rel_id: 0 }).unwrap();
         assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
         assert_eq!(
             smgr.file_size_in_page(&shandle, ForkType::Main).ok(),

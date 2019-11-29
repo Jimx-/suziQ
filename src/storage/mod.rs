@@ -23,7 +23,9 @@ pub use self::{
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct RelFileRef {
     pub db: OID,
     pub rel_id: OID,
@@ -159,7 +161,10 @@ pub trait RelationWithStorage: Relation {
         match &*guard {
             Some(shandle) => f(shandle),
             None => {
-                let shandle = smgr.open(self.rel_db(), self.rel_id())?;
+                let shandle = smgr.open(RelFileRef {
+                    db: self.rel_db(),
+                    rel_id: self.rel_id(),
+                })?;
                 *guard = Some(shandle.clone());
                 f(&shandle)
             }

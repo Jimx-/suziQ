@@ -65,8 +65,7 @@ impl StorageManager {
         }
     }
 
-    pub fn open(&self, db: OID, rel_id: OID) -> Result<StorageHandle> {
-        let file_ref = RelFileRef { db, rel_id };
+    pub fn open(&self, file_ref: RelFileRef) -> Result<StorageHandle> {
         let mut guard = self.shandles.lock().unwrap();
         let handle = guard
             .entry(file_ref)
@@ -110,6 +109,23 @@ impl StorageManager {
                 *guard = Some(file);
                 Ok(())
             }
+        }
+    }
+
+    pub fn exists(&self, db_id: OID, rel_id: OID, fork: ForkType) -> Result<bool> {
+        let rel_path = self.rel_path(RelFileRef { db: db_id, rel_id }, fork);
+
+        if rel_path.exists() {
+            if rel_path.is_file() {
+                Ok(true)
+            } else {
+                Err(Error::WrongObjectType(format!(
+                    "'{}' exists but is not a regular file",
+                    rel_path.as_path().display()
+                )))
+            }
+        } else {
+            Ok(false)
         }
     }
 
@@ -218,7 +234,11 @@ impl StorageManager {
             Some(file) => f(file),
             guard_ref @ None => {
                 let rel_path = self.rel_path(shandle.file_ref, fork);
-                let file = File::open(rel_path)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .open(rel_path)?;
 
                 *guard_ref = Some(file);
 
@@ -271,7 +291,7 @@ mod tests {
     #[test]
     fn can_create_relation() {
         let (smgr, db_dir) = get_temp_smgr();
-        let shandle = smgr.open(0, 0).unwrap();
+        let shandle = smgr.open(RelFileRef { db: 0, rel_id: 0 }).unwrap();
         assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
         assert!(shandle.forks[0].lock().unwrap().is_some());
 
@@ -285,7 +305,7 @@ mod tests {
     #[test]
     fn can_read_write() {
         let (smgr, db_dir) = get_temp_smgr();
-        let shandle = smgr.open(0, 0).unwrap();
+        let shandle = smgr.open(RelFileRef { db: 0, rel_id: 0 }).unwrap();
         assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
 
         let wbuf = [1u8; PAGE_SIZE];
@@ -301,7 +321,7 @@ mod tests {
     #[test]
     fn can_truncate() {
         let (smgr, db_dir) = get_temp_smgr();
-        let shandle = smgr.open(0, 0).unwrap();
+        let shandle = smgr.open(RelFileRef { db: 0, rel_id: 0 }).unwrap();
         assert!(smgr.create(&shandle, ForkType::Main, false).is_ok());
 
         let wbuf = [1u8; PAGE_SIZE];

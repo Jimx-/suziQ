@@ -173,10 +173,7 @@ impl PageCache {
 
         let smgr = db.get_storage_manager();
         let (rel, fork, num) = page.get_fork_and_num();
-        let shandle = {
-            let RelFileRef { db, rel_id } = rel;
-            smgr.open(db, rel_id)
-        }?;
+        let shandle = { smgr.open(rel) }?;
         smgr.write(&shandle, fork, num, buffer)?;
 
         page.set_dirty(false);

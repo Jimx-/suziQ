@@ -6,8 +6,8 @@ use crate::{
     concurrency::{Transaction, XID},
     storage::{
         consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
-        RelationWithStorage, ScanDirection, StorageHandle, Table, TableData, TableScanIterator,
-        Tuple,
+        RelFileRef, RelationWithStorage, ScanDirection, StorageHandle, Table, TableData,
+        TableScanIterator, Tuple,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
@@ -118,12 +118,7 @@ impl Heap {
         }
     }
 
-    fn prepare_heap_tuple_for_insert<'a>(
-        &self,
-        txn: &Transaction,
-        data: &'a [u8],
-    ) -> HeapTuple<'a> {
-        let xid = txn.xid();
+    fn prepare_heap_tuple_for_insert<'a>(&self, xid: XID, data: &'a [u8]) -> HeapTuple<'a> {
         let mut htup = HeapTuple::new(self.rel_id(), data).materialize();
         htup.min_xid = xid;
         htup
@@ -484,15 +479,24 @@ impl Table for Heap {
     }
 
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer> {
-        let htup = self.prepare_heap_tuple_for_insert(txn, tuple);
+        let htup = self.prepare_heap_tuple_for_insert(txn.xid(), tuple);
         let htup_buf = bincode::serialize(&htup).unwrap();
         let htup_len = htup_buf.len();
 
         let itemp = self.with_page_for_tuple(db, htup_len, |page_view, page_num| {
-            let off = page_view.put_tuple(&htup_buf)?;
+            let off = page_view.put_tuple(&htup_buf, None)?;
             // create insert log
-            let insert_log =
-                HeapLogRecord::create_heap_insert_log(self.rel_id(), page_num, off, &htup_buf);
+            let insert_log = HeapLogRecord::create_heap_insert_log(
+                txn.xid(),
+                RelFileRef {
+                    db: self.rel_db(),
+                    rel_id: self.rel_id(),
+                },
+                ForkType::Main,
+                page_num,
+                off,
+                tuple,
+            );
             let (_, lsn) = db.get_wal().append(&insert_log)?;
             page_view.set_lsn(lsn);
             Ok((ItemPointer::new(page_num, off), true))

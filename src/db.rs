@@ -9,7 +9,7 @@ use crate::{
     am::heap::Heap,
     catalog::{CatalogCache, Schema},
     concurrency::{Transaction, TransactionManager},
-    storage::{BufferManager, RelationWithStorage, StorageManager, TablePtr},
+    storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
     wal::{CheckpointManager, Wal},
     Result,
 };
@@ -17,7 +17,7 @@ use crate::{
 pub struct DB {
     bufmgr: BufferManager,
     smgr: StorageManager,
-    catalog_cache: CatalogCache,
+    catalog_cache: Mutex<CatalogCache>,
     txnmgr: TransactionManager,
     wal: Wal,
     ckptmgr: Mutex<CheckpointManager>,
@@ -34,7 +34,7 @@ impl DB {
         let db = Self {
             bufmgr,
             smgr,
-            catalog_cache,
+            catalog_cache: Mutex::new(catalog_cache),
             txnmgr,
             wal,
             ckptmgr: Mutex::new(ckptmgr),
@@ -66,14 +66,27 @@ impl DB {
     }
 
     pub fn create_table(&self, db: OID, rel_id: OID, schema: Schema) -> Result<TablePtr> {
+        let mut guard = self.catalog_cache.lock().unwrap();
         let heap = Arc::new(Heap::new(rel_id, db, schema));
         heap.create_storage(&self.smgr)?;
-        self.catalog_cache.add_table(heap.clone());
+        guard.add_table(heap.clone());
         Ok(heap)
     }
 
-    pub fn open_table(&self, rel_id: OID) -> Option<TablePtr> {
-        self.catalog_cache.lookup_table(rel_id)
+    pub fn open_table(&self, db: OID, rel_id: OID) -> Result<Option<TablePtr>> {
+        let mut guard = self.catalog_cache.lock().unwrap();
+        match guard.lookup_table(rel_id) {
+            Some(table) => Ok(Some(table)),
+            None => {
+                if self.smgr.exists(db, rel_id, ForkType::Main)? {
+                    let heap = Arc::new(Heap::new(rel_id, db, Schema::new()));
+                    guard.add_table(heap.clone());
+                    Ok(Some(heap))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     pub fn start_transaction(&self) -> Result<Transaction> {
