@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CheckpointLog {
     pub redo_pos: LogPointer,
+    pub next_oid: OID,
 }
 
 impl CheckpointLog {
@@ -42,8 +43,8 @@ impl WalLogRecord {
         }
     }
 
-    pub fn create_checkpoint_log<'a>(redo_pos: LogPointer) -> LogRecord<'a> {
-        let checkpoint_record = CheckpointLog { redo_pos };
+    pub fn create_checkpoint_log<'a>(redo_pos: LogPointer, next_oid: OID) -> LogRecord<'a> {
+        let checkpoint_record = CheckpointLog { redo_pos, next_oid };
         LogRecord::create_wal_record(WalLogRecord::Checkpoint(checkpoint_record))
     }
 

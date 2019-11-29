@@ -166,14 +166,14 @@ impl Wal {
             let last_checkpoint_pos = master_record.last_checkpoint_pos;
             let redo_pos = if is_valid_lsn(last_checkpoint_pos) {
                 let reader = self.get_reader(last_checkpoint_pos)?;
-                match reader.read_record(last_checkpoint_pos)? {
+                let checkpoint_log = match reader.read_record(last_checkpoint_pos)? {
                     None => {
                         return Err(Error::DataCorrupted(
                             "cannot load the checkpoint log record".to_owned(),
                         ))
                     }
                     Some((_, recbuf)) => match bincode::deserialize::<LogRecord>(&recbuf) {
-                        Ok(LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log))) => ckpt_log.redo_pos,
+                        Ok(LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log))) => ckpt_log,
                         Ok(_) => {
                             return Err(Error::DataCorrupted(
                                 "last checkpoint pos points to non checkpoint record".to_owned(),
@@ -185,7 +185,10 @@ impl Wal {
                             ))
                         }
                     },
-                }
+                };
+
+                db.set_next_oid(checkpoint_log.next_oid);
+                checkpoint_log.redo_pos
             } else {
                 0
             };

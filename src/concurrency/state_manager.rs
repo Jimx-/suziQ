@@ -55,6 +55,12 @@ impl StateManager {
         Ok(next_oid)
     }
 
+    pub fn max_allocated_oid(&self) -> OID {
+        let guard = self.oid_allocator.lock().unwrap();
+
+        guard.next_oid + guard.oid_count as OID
+    }
+
     pub fn set_next_oid(&self, oid: OID) {
         let mut guard = self.oid_allocator.lock().unwrap();
         guard.next_oid = oid;

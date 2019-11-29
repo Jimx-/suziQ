@@ -1,6 +1,6 @@
 use crate::{
     wal::{LogPointer, WalLogRecord},
-    Error, Result, DB,
+    Error, Result, DB, OID,
 };
 
 use std::{
@@ -27,6 +27,7 @@ pub enum DBState {
 pub struct MasterRecord {
     pub db_state: DBState,
     pub last_checkpoint_pos: LogPointer,
+    pub next_oid: OID,
     pub time: SystemTime,
 }
 
@@ -35,6 +36,7 @@ impl Default for MasterRecord {
         Self {
             db_state: DBState::Shutdowned,
             last_checkpoint_pos: 0,
+            next_oid: 0,
             time: SystemTime::now(),
         }
     }
@@ -133,12 +135,15 @@ impl CheckpointManager {
         let wal = db.get_wal();
         let redo_lsn = wal.current_lsn();
 
+        // record all information needed for the checkpoint
+        let next_oid = db.get_state_manager().max_allocated_oid();
+
         // sync all buffers
         let bufmgr = db.get_buffer_manager();
         bufmgr.sync_pages(db)?;
 
         // write checkpoint log
-        let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn);
+        let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn, next_oid);
         let (checkpoint, checkpoint_lsn) = wal.append(&checkpoint_log)?;
         wal.flush(Some(checkpoint_lsn))?;
 
@@ -146,6 +151,7 @@ impl CheckpointManager {
         let master_record = &mut self.master_record;
         master_record.time = SystemTime::now();
         master_record.last_checkpoint_pos = checkpoint;
+        master_record.next_oid = next_oid;
         self.master_record_file.write_master_record(master_record)?;
         Ok(())
     }

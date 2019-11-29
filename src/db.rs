@@ -60,6 +60,10 @@ impl DB {
         &self.wal
     }
 
+    pub fn get_state_manager(&self) -> &StateManager {
+        &self.statemgr
+    }
+
     pub fn with_checkpoint_manager<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut CheckpointManager) -> Result<R>,
