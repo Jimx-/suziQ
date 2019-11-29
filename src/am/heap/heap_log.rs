@@ -25,10 +25,6 @@ pub struct HeapInsertLog<'a> {
 
 impl<'a> HeapInsertLog<'a> {
     pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
-        println!(
-            "redo heap insert: xid: {}, file ref: {}, fork: {:?}, page num: {}, offset: {}",
-            self.xid, self.file_ref, self.fork, self.page_num, self.offset
-        );
         let smgr = db.get_storage_manager();
         let bufmgr = db.get_buffer_manager();
 

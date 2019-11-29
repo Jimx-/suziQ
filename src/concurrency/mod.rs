@@ -1,9 +1,10 @@
+mod state_manager;
 mod transaction;
 mod transaction_log;
 mod transaction_manager;
 
 pub use self::{
-    transaction::Transaction, transaction_log::TransactionLogRecord,
+    state_manager::StateManager, transaction::Transaction, transaction_log::TransactionLogRecord,
     transaction_manager::TransactionManager,
 };
 

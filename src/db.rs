@@ -8,7 +8,7 @@ use std::{
 use crate::{
     am::heap::Heap,
     catalog::{CatalogCache, Schema},
-    concurrency::{Transaction, TransactionManager},
+    concurrency::{StateManager, Transaction, TransactionManager},
     storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
     wal::{CheckpointManager, Wal},
     Result,
@@ -21,6 +21,7 @@ pub struct DB {
     txnmgr: TransactionManager,
     wal: Wal,
     ckptmgr: Mutex<CheckpointManager>,
+    statemgr: StateManager,
 }
 
 impl DB {
@@ -31,6 +32,7 @@ impl DB {
         let txnmgr = TransactionManager::new();
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
         let ckptmgr = CheckpointManager::open(config.get_master_record_path())?;
+        let statemgr = StateManager::new();
         let db = Self {
             bufmgr,
             smgr,
@@ -38,6 +40,7 @@ impl DB {
             txnmgr,
             wal,
             ckptmgr: Mutex::new(ckptmgr),
+            statemgr,
         };
 
         db.wal.startup(&db)?;
@@ -101,5 +104,13 @@ impl DB {
         let mut guard = self.ckptmgr.lock().unwrap();
 
         guard.create_checkpoint(self)
+    }
+
+    pub fn get_next_oid(&self) -> Result<OID> {
+        self.statemgr.get_next_oid(self)
+    }
+
+    pub fn set_next_oid(&self, oid: OID) {
+        self.statemgr.set_next_oid(oid);
     }
 }

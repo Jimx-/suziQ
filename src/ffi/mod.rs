@@ -352,3 +352,19 @@ pub extern "C" fn sq_create_checkpoint(db: *const DB) {
         }
     };
 }
+
+#[no_mangle]
+pub extern "C" fn sq_get_next_oid(db: *const DB) -> OID {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    match db.get_next_oid() {
+        Ok(oid) => oid,
+        Err(e) => {
+            update_last_error(e);
+            0
+        }
+    }
+}
