@@ -31,14 +31,18 @@ impl DB {
         let txnmgr = TransactionManager::new();
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
         let ckptmgr = CheckpointManager::open(config.get_master_record_path())?;
-        Ok(Self {
+        let db = Self {
             bufmgr,
             smgr,
             catalog_cache,
             txnmgr,
             wal,
             ckptmgr: Mutex::new(ckptmgr),
-        })
+        };
+
+        db.wal.startup(&db)?;
+
+        Ok(db)
     }
 
     pub fn get_storage_manager(&self) -> &StorageManager {
@@ -51,6 +55,14 @@ impl DB {
 
     pub fn get_wal(&self) -> &Wal {
         &self.wal
+    }
+
+    pub fn with_checkpoint_manager<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut CheckpointManager) -> Result<R>,
+    {
+        let mut guard = self.ckptmgr.lock().unwrap();
+        f(&mut *guard)
     }
 
     pub fn create_table(&self, db: OID, rel_id: OID, schema: Schema) -> Result<TablePtr> {

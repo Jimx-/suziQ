@@ -1,4 +1,9 @@
-use crate::{am::heap::HeapLogRecord, concurrency::TransactionLogRecord, wal::WalLogRecord};
+use crate::{
+    am::heap::HeapLogRecord,
+    concurrency::TransactionLogRecord,
+    wal::{LogPointer, WalLogRecord},
+    Result, DB,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +16,13 @@ pub enum LogRecord<'a> {
 }
 
 impl<'a> LogRecord<'a> {
+    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+        match self {
+            LogRecord::Heap(heap_log) => heap_log.apply(db, lsn),
+            LogRecord::Transaction(txn_log) => txn_log.apply(db, lsn),
+            LogRecord::Wal(wal_log) => wal_log.apply(db, lsn),
+        }
+    }
     pub fn create_heap_record(heap_log_record: HeapLogRecord) -> LogRecord {
         LogRecord::Heap(heap_log_record)
     }

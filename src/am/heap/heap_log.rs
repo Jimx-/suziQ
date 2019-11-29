@@ -1,4 +1,7 @@
-use crate::{wal::LogRecord, OID};
+use crate::{
+    wal::{LogPointer, LogRecord},
+    Result, DB, OID,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +14,12 @@ pub struct HeapInsertLog<'a> {
     tuple_data: &'a [u8],
 }
 
+impl<'a> HeapInsertLog<'a> {
+    pub fn apply(self, _db: &DB, _lsn: LogPointer) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum HeapLogRecord<'a> {
     #[serde(borrow)]
@@ -18,6 +27,12 @@ pub enum HeapLogRecord<'a> {
 }
 
 impl<'a> HeapLogRecord<'a> {
+    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+        match self {
+            HeapLogRecord::HeapInsert(heap_insert_log) => heap_insert_log.apply(db, lsn),
+        }
+    }
+
     pub fn create_heap_insert_log(
         heap_id: OID,
         page_num: usize,

@@ -15,17 +15,27 @@ use crc::crc32;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DBState {
+    Shutdowned,
+    Shutdowning,
+    InCrashRecovery,
+    InProduction,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MasterRecord {
-    last_checkpoint_lsn: LogPointer,
-    checkpoint_time: SystemTime,
+    pub db_state: DBState,
+    pub last_checkpoint_pos: LogPointer,
+    pub time: SystemTime,
 }
 
 impl Default for MasterRecord {
     fn default() -> Self {
         Self {
-            last_checkpoint_lsn: 0,
-            checkpoint_time: SystemTime::now(),
+            db_state: DBState::Shutdowned,
+            last_checkpoint_pos: 0,
+            time: SystemTime::now(),
         }
     }
 }
@@ -109,18 +119,14 @@ pub struct CheckpointManager {
 impl CheckpointManager {
     pub fn open<P: AsRef<Path>>(master_record_path: P) -> Result<Self> {
         let master_record_file = MasterRecordFile::new(master_record_path);
-        let master_record = match master_record_file.read_master_record()? {
-            Some(record) => record,
-            _ => {
-                let record = MasterRecord::default();
-                master_record_file.write_master_record(&record)?;
-                record
-            }
-        };
-        Ok(Self {
+        let mut ckptmgr = Self {
             master_record_file,
-            master_record,
-        })
+            master_record: Default::default(),
+        };
+
+        ckptmgr.read_master_record()?;
+
+        Ok(ckptmgr)
     }
 
     pub fn create_checkpoint(&mut self, db: &DB) -> Result<()> {
@@ -133,15 +139,34 @@ impl CheckpointManager {
 
         // write checkpoint log
         let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn);
-        let checkpoint_lsn = wal.append(&checkpoint_log)?;
+        let (checkpoint, checkpoint_lsn) = wal.append(&checkpoint_log)?;
         wal.flush(Some(checkpoint_lsn))?;
 
         // update the master record
         let master_record = &mut self.master_record;
-        master_record.checkpoint_time = SystemTime::now();
-        master_record.last_checkpoint_lsn = checkpoint_lsn;
+        master_record.time = SystemTime::now();
+        master_record.last_checkpoint_pos = checkpoint;
         self.master_record_file.write_master_record(master_record)?;
         Ok(())
+    }
+
+    pub fn read_master_record(&mut self) -> Result<&MasterRecord> {
+        self.master_record = match self.master_record_file.read_master_record()? {
+            Some(record) => record,
+            _ => {
+                // the master record file is not yet initialized
+                let record = MasterRecord::default();
+                self.master_record_file.write_master_record(&record)?;
+                record
+            }
+        };
+        Ok(&self.master_record)
+    }
+    pub fn set_db_state(&mut self, state: DBState) -> Result<()> {
+        self.master_record.db_state = state;
+        self.master_record.time = SystemTime::now();
+        self.master_record_file
+            .write_master_record(&self.master_record)
     }
 }
 

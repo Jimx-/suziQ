@@ -47,7 +47,7 @@ impl PageCache {
 
             Ok(page_ptr)
         } else {
-            match self.evict(db) {
+            match self.evict() {
                 Some(page_ptr) => {
                     page_ptr.with_write(|page| {
                         if page.is_dirty() {
@@ -141,11 +141,11 @@ impl PageCache {
                     .pin_if(Page::is_dirty)
                     .unwrap()
                     .map(|(pin_count, pinned_page)| {
-                        let (rel, fork, num) = pinned_page
-                            .with_read(|page| Ok(page.get_fork_and_num()))
-                            .unwrap();
-                        let tag = PageTag(rel, fork, num);
                         if pin_count == 1 {
+                            let (rel, fork, num) = pinned_page
+                                .with_read(|page| Ok(page.get_fork_and_num()))
+                                .unwrap();
+                            let tag = PageTag(rel, fork, num);
                             lru.pop(&tag);
                         }
 
@@ -154,7 +154,7 @@ impl PageCache {
             })
             .collect()
     }
-    fn evict(&mut self, _db: &DB) -> Option<PagePtr> {
+    fn evict(&mut self) -> Option<PagePtr> {
         match self.lru.pop_lru() {
             Some((tag, victim)) => {
                 let page_ptr = self.page_pool[victim].clone();

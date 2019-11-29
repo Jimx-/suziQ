@@ -493,7 +493,7 @@ impl Table for Heap {
             // create insert log
             let insert_log =
                 HeapLogRecord::create_heap_insert_log(self.rel_id(), page_num, off, &htup_buf);
-            let lsn = db.get_wal().append(&insert_log)?;
+            let (_, lsn) = db.get_wal().append(&insert_log)?;
             page_view.set_lsn(lsn);
             Ok((ItemPointer::new(page_num, off), true))
         })?;
