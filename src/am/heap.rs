@@ -487,7 +487,6 @@ impl Table for Heap {
             let off = page_view.put_tuple(&htup_buf, None)?;
             // create insert log
             let insert_log = HeapLogRecord::create_heap_insert_log(
-                txn.xid(),
                 RelFileRef {
                     db: self.rel_db(),
                     rel_id: self.rel_id(),
@@ -497,7 +496,7 @@ impl Table for Heap {
                 off,
                 tuple,
             );
-            let (_, lsn) = db.get_wal().append(&insert_log)?;
+            let (_, lsn) = db.get_wal().append(txn.xid(), insert_log)?;
             page_view.set_lsn(lsn);
             Ok((ItemPointer::new(page_num, off), true))
         })?;

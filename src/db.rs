@@ -56,6 +56,10 @@ impl DB {
         &self.bufmgr
     }
 
+    pub fn get_transaction_manager(&self) -> &TransactionManager {
+        &self.txnmgr
+    }
+
     pub fn get_wal(&self) -> &Wal {
         &self.wal
     }
@@ -112,9 +116,5 @@ impl DB {
 
     pub fn get_next_oid(&self) -> Result<OID> {
         self.statemgr.get_next_oid(self)
-    }
-
-    pub fn set_next_oid(&self, oid: OID) {
-        self.statemgr.set_next_oid(oid);
     }
 }

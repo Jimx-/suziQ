@@ -1,4 +1,5 @@
 use crate::{
+    concurrency::XID,
     wal::{LogPointer, LogRecord},
     Result, DB, OID,
 };
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct CheckpointLog {
     pub redo_pos: LogPointer,
     pub next_oid: OID,
+    pub next_xid: XID,
 }
 
 impl CheckpointLog {
@@ -24,7 +26,7 @@ pub struct NextOidLog {
 
 impl NextOidLog {
     pub fn apply(self, db: &DB, _lsn: LogPointer) -> Result<()> {
-        db.set_next_oid(self.next_oid);
+        db.get_state_manager().set_next_oid(self.next_oid);
         Ok(())
     }
 }
@@ -36,15 +38,23 @@ pub enum WalLogRecord {
 }
 
 impl WalLogRecord {
-    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, db: &DB, _xid: XID, lsn: LogPointer) -> Result<()> {
         match self {
             WalLogRecord::Checkpoint(checkpoint_log) => checkpoint_log.apply(db, lsn),
             WalLogRecord::NextOid(next_oid_log) => next_oid_log.apply(db, lsn),
         }
     }
 
-    pub fn create_checkpoint_log<'a>(redo_pos: LogPointer, next_oid: OID) -> LogRecord<'a> {
-        let checkpoint_record = CheckpointLog { redo_pos, next_oid };
+    pub fn create_checkpoint_log<'a>(
+        redo_pos: LogPointer,
+        next_oid: OID,
+        next_xid: XID,
+    ) -> LogRecord<'a> {
+        let checkpoint_record = CheckpointLog {
+            redo_pos,
+            next_oid,
+            next_xid,
+        };
         LogRecord::create_wal_record(WalLogRecord::Checkpoint(checkpoint_record))
     }
 

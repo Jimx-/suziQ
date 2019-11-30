@@ -1,15 +1,56 @@
 mod state_manager;
-mod transaction;
 mod transaction_log;
 mod transaction_manager;
 
 pub use self::{
-    state_manager::StateManager, transaction::Transaction, transaction_log::TransactionLogRecord,
+    state_manager::StateManager, transaction_log::TransactionLogRecord,
     transaction_manager::TransactionManager,
 };
 
-pub type XID = u64;
+pub type XID = u32;
 
 pub fn is_invalid_xid(xid: XID) -> bool {
     xid == 0
+}
+
+pub fn compare_xid(a: XID, b: XID) -> std::cmp::Ordering {
+    if is_invalid_xid(a) || is_invalid_xid(b) {
+        a.cmp(&b)
+    } else {
+        let delta = (a - b) as i32;
+        delta.cmp(&0)
+    }
+}
+
+// #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// pub enum TransactionState {
+//     InProgress,
+//     Commit,
+//     Abort,
+// }
+
+pub struct Transaction {
+    xid: XID,
+    // state: TransactionState,
+}
+
+impl Transaction {
+    pub fn new(xid: XID) -> Self {
+        Self {
+            xid,
+            // state: TransactionState::InProgress,
+        }
+    }
+
+    pub fn xid(&self) -> XID {
+        self.xid
+    }
+
+    // pub fn state(&self) -> TransactionState {
+    //     self.state
+    // }
+
+    // pub fn set_state(&mut self, state: TransactionState) {
+    //     self.state = state;
+    // }
 }

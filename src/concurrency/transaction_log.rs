@@ -1,4 +1,5 @@
 use crate::{
+    concurrency::XID,
     wal::{LogPointer, LogRecord},
     Result, DB,
 };
@@ -13,7 +14,7 @@ pub struct TxnCommitLog {
 }
 
 impl TxnCommitLog {
-    pub fn apply(self, _db: &DB, _lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, _db: &DB, _xid: XID, _lsn: LogPointer) -> Result<()> {
         Ok(())
     }
 }
@@ -24,9 +25,9 @@ pub enum TransactionLogRecord {
 }
 
 impl TransactionLogRecord {
-    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, db: &DB, xid: XID, lsn: LogPointer) -> Result<()> {
         match self {
-            TransactionLogRecord::Commit(commit_log) => commit_log.apply(db, lsn),
+            TransactionLogRecord::Commit(commit_log) => commit_log.apply(db, xid, lsn),
         }
     }
 

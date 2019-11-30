@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct HeapInsertLog<'a> {
-    xid: XID,
     file_ref: RelFileRef,
     fork: ForkType,
     page_num: usize,
@@ -24,7 +23,7 @@ pub struct HeapInsertLog<'a> {
 }
 
 impl<'a> HeapInsertLog<'a> {
-    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, db: &DB, xid: XID, lsn: LogPointer) -> Result<()> {
         let smgr = db.get_storage_manager();
         let bufmgr = db.get_buffer_manager();
 
@@ -48,7 +47,7 @@ impl<'a> HeapInsertLog<'a> {
 
             let RelFileRef { rel_id, .. } = self.file_ref;
             let mut htup = HeapTuple::new(rel_id, self.tuple_data).materialize();
-            htup.min_xid = self.xid;
+            htup.min_xid = xid;
             let htup_buf = bincode::serialize(&htup).unwrap();
 
             page_view.put_tuple(&htup_buf, Some(self.offset as usize))?;
@@ -69,14 +68,13 @@ pub enum HeapLogRecord<'a> {
 }
 
 impl<'a> HeapLogRecord<'a> {
-    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, db: &DB, xid: XID, lsn: LogPointer) -> Result<()> {
         match self {
-            HeapLogRecord::HeapInsert(heap_insert_log) => heap_insert_log.apply(db, lsn),
+            HeapLogRecord::HeapInsert(heap_insert_log) => heap_insert_log.apply(db, xid, lsn),
         }
     }
 
     pub fn create_heap_insert_log(
-        xid: XID,
         file_ref: RelFileRef,
         fork: ForkType,
         page_num: usize,
@@ -84,7 +82,6 @@ impl<'a> HeapLogRecord<'a> {
         tuple_data: &[u8],
     ) -> LogRecord {
         let heap_insert_record = HeapInsertLog {
-            xid,
             file_ref,
             fork,
             page_num,

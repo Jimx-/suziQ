@@ -1,6 +1,6 @@
 use crate::{
     am::heap::HeapLogRecord,
-    concurrency::TransactionLogRecord,
+    concurrency::{TransactionLogRecord, XID},
     wal::{LogPointer, WalLogRecord},
     Result, DB,
 };
@@ -16,11 +16,11 @@ pub enum LogRecord<'a> {
 }
 
 impl<'a> LogRecord<'a> {
-    pub fn apply(self, db: &DB, lsn: LogPointer) -> Result<()> {
+    pub fn apply(self, db: &DB, xid: XID, lsn: LogPointer) -> Result<()> {
         match self {
-            LogRecord::Heap(heap_log) => heap_log.apply(db, lsn),
-            LogRecord::Transaction(txn_log) => txn_log.apply(db, lsn),
-            LogRecord::Wal(wal_log) => wal_log.apply(db, lsn),
+            LogRecord::Heap(heap_log) => heap_log.apply(db, xid, lsn),
+            LogRecord::Transaction(txn_log) => txn_log.apply(db, xid, lsn),
+            LogRecord::Wal(wal_log) => wal_log.apply(db, xid, lsn),
         }
     }
     pub fn create_heap_record(heap_log_record: HeapLogRecord) -> LogRecord {

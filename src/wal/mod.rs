@@ -12,7 +12,7 @@ pub use self::{
 
 use self::{reader::WalReader, segment::Segment};
 
-use crate::{Error, Result, DB};
+use crate::{concurrency::XID, Error, Result, DB};
 
 use std::{
     fs::{self, DirBuilder, File},
@@ -22,6 +22,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use serde::{Deserialize, Serialize};
 
 pub type LogPointer = u64;
 
@@ -45,6 +46,13 @@ impl WalConfig {
     pub fn new() -> Self {
         Self::default()
     }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct FullLogRecord<'a> {
+    xid: XID,
+    #[serde(borrow)]
+    payload: LogRecord<'a>,
 }
 
 pub struct Wal {
@@ -112,8 +120,12 @@ impl Wal {
         })
     }
 
-    pub fn append(&self, record: &LogRecord) -> Result<(LogPointer, LogPointer)> {
-        let buf = bincode::serialize(record).unwrap();
+    pub fn append(&self, xid: XID, record: LogRecord) -> Result<(LogPointer, LogPointer)> {
+        let full_record = FullLogRecord {
+            xid,
+            payload: record,
+        };
+        let buf = bincode::serialize(&full_record).unwrap();
         self.append_raw(&buf)
     }
 
@@ -172,8 +184,11 @@ impl Wal {
                             "cannot load the checkpoint log record".to_owned(),
                         ))
                     }
-                    Some((_, recbuf)) => match bincode::deserialize::<LogRecord>(&recbuf) {
-                        Ok(LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log))) => ckpt_log,
+                    Some((_, recbuf)) => match bincode::deserialize::<FullLogRecord>(&recbuf) {
+                        Ok(FullLogRecord {
+                            payload: LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log)),
+                            ..
+                        }) => ckpt_log,
                         Ok(_) => {
                             return Err(Error::DataCorrupted(
                                 "last checkpoint pos points to non checkpoint record".to_owned(),
@@ -187,7 +202,9 @@ impl Wal {
                     },
                 };
 
-                db.set_next_oid(checkpoint_log.next_oid);
+                db.get_state_manager().set_next_oid(checkpoint_log.next_oid);
+                db.get_transaction_manager()
+                    .set_next_xid(checkpoint_log.next_xid);
                 checkpoint_log.redo_pos
             } else {
                 0
@@ -210,8 +227,8 @@ impl Wal {
                 for rec in reader.iter() {
                     // this is the main redo apply loop
                     let (lsn, recbuf) = rec?;
-                    let redo = match bincode::deserialize::<LogRecord>(&recbuf) {
-                        Ok(record) => record,
+                    let (xid, redo) = match bincode::deserialize::<FullLogRecord>(&recbuf) {
+                        Ok(FullLogRecord { xid, payload }) => (xid, payload),
                         _ => {
                             return Err(Error::DataCorrupted(
                                 "invalid log record during recovery".to_owned(),
@@ -219,7 +236,8 @@ impl Wal {
                         }
                     };
 
-                    redo.apply(db, lsn)?;
+                    db.get_transaction_manager().advance_next_xid_past(xid);
+                    redo.apply(db, xid, lsn)?;
                 }
             }
             Ok(())

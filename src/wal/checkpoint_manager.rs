@@ -1,4 +1,5 @@
 use crate::{
+    concurrency::XID,
     wal::{LogPointer, WalLogRecord},
     Error, Result, DB, OID,
 };
@@ -28,6 +29,7 @@ pub struct MasterRecord {
     pub db_state: DBState,
     pub last_checkpoint_pos: LogPointer,
     pub next_oid: OID,
+    pub next_xid: XID,
     pub time: SystemTime,
 }
 
@@ -37,6 +39,7 @@ impl Default for MasterRecord {
             db_state: DBState::Shutdowned,
             last_checkpoint_pos: 0,
             next_oid: 0,
+            next_xid: 1,
             time: SystemTime::now(),
         }
     }
@@ -137,14 +140,15 @@ impl CheckpointManager {
 
         // record all information needed for the checkpoint
         let next_oid = db.get_state_manager().max_allocated_oid();
+        let next_xid = db.get_transaction_manager().read_next_id();
 
         // sync all buffers
         let bufmgr = db.get_buffer_manager();
         bufmgr.sync_pages(db)?;
 
         // write checkpoint log
-        let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn, next_oid);
-        let (checkpoint, checkpoint_lsn) = wal.append(&checkpoint_log)?;
+        let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn, next_oid, next_xid);
+        let (checkpoint, checkpoint_lsn) = wal.append(0, checkpoint_log)?;
         wal.flush(Some(checkpoint_lsn))?;
 
         // update the master record
@@ -152,6 +156,7 @@ impl CheckpointManager {
         master_record.time = SystemTime::now();
         master_record.last_checkpoint_pos = checkpoint;
         master_record.next_oid = next_oid;
+        master_record.next_xid = next_xid;
         self.master_record_file.write_master_record(master_record)?;
         Ok(())
     }
