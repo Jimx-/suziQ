@@ -10,7 +10,7 @@ use crate::{
     catalog::{CatalogCache, Schema},
     concurrency::{StateManager, Transaction, TransactionManager},
     storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
-    wal::{CheckpointManager, Wal},
+    wal::{CheckpointManager, DBState, Wal},
     Result,
 };
 
@@ -29,7 +29,7 @@ impl DB {
         let smgr = StorageManager::new(config.get_storage_path());
         let bufmgr = BufferManager::new(config.cache_capacity);
         let catalog_cache = CatalogCache::new();
-        let txnmgr = TransactionManager::new();
+        let txnmgr = TransactionManager::open(config.get_transaction_path())?;
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
         let ckptmgr = CheckpointManager::open(config.get_master_record_path())?;
         let statemgr = StateManager::new();
@@ -43,7 +43,7 @@ impl DB {
             statemgr,
         };
 
-        db.wal.startup(&db)?;
+        db.startup()?;
 
         Ok(db)
     }
@@ -68,12 +68,40 @@ impl DB {
         &self.statemgr
     }
 
-    pub fn with_checkpoint_manager<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut CheckpointManager) -> Result<R>,
-    {
+    pub fn startup(&self) -> Result<()> {
         let mut guard = self.ckptmgr.lock().unwrap();
-        f(&mut *guard)
+
+        let master_record = guard.read_master_record()?;
+        let last_checkpoint_pos = master_record.last_checkpoint_pos();
+        let checkpoint_log = self.wal.read_checkpoint_record(last_checkpoint_pos)?;
+        let redo_pos = match checkpoint_log {
+            Some(checkpoint_log) => {
+                self.statemgr.set_next_oid(checkpoint_log.next_oid);
+                self.txnmgr.set_next_xid(checkpoint_log.next_xid);
+                checkpoint_log.redo_pos
+            }
+            _ => 0,
+        };
+
+        let current_lsn = self.wal.current_lsn();
+        if current_lsn < redo_pos {
+            return Err(Error::DataCorrupted(
+                "invalid redo point in checkpoint record".to_owned(),
+            ));
+        }
+
+        let need_recovery =
+            current_lsn > redo_pos || master_record.db_state() != DBState::Shutdowned;
+
+        if need_recovery {
+            guard.set_db_state(DBState::InCrashRecovery)?;
+
+            self.wal.replay_logs(self, redo_pos)?;
+        }
+
+        self.txnmgr.init_state();
+        guard.set_db_state(DBState::InProduction)?;
+        Ok(())
     }
 
     pub fn create_table(&self, db: OID, rel_id: OID, schema: Schema) -> Result<TablePtr> {
@@ -101,7 +129,7 @@ impl DB {
     }
 
     pub fn start_transaction(&self) -> Result<Transaction> {
-        self.txnmgr.start_transaction()
+        self.txnmgr.start_transaction(self)
     }
 
     pub fn commit_transaction(&self, txn: Transaction) -> Result<()> {

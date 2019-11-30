@@ -7,7 +7,7 @@ mod wal_log;
 pub use self::{
     checkpoint_manager::{CheckpointManager, DBState},
     log_record::LogRecord,
-    wal_log::WalLogRecord,
+    wal_log::{CheckpointLog, WalLogRecord},
 };
 
 use self::{reader::WalReader, segment::Segment};
@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 
 pub type LogPointer = u64;
 
-pub fn is_valid_lsn(lsn: LogPointer) -> bool {
-    lsn > 0
+pub fn is_invalid_lsn(lsn: LogPointer) -> bool {
+    lsn == 0
 }
 
 pub struct WalConfig {
@@ -172,76 +172,53 @@ impl Wal {
         WalReader::open(&self.path, self.capacity, start_pos)
     }
 
-    pub fn startup(&self, db: &DB) -> Result<()> {
-        db.with_checkpoint_manager(|ckptmgr| {
-            let master_record = ckptmgr.read_master_record()?;
-            let last_checkpoint_pos = master_record.last_checkpoint_pos;
-            let redo_pos = if is_valid_lsn(last_checkpoint_pos) {
-                let reader = self.get_reader(last_checkpoint_pos)?;
-                let checkpoint_log = match reader.read_record(last_checkpoint_pos)? {
-                    None => {
-                        return Err(Error::DataCorrupted(
-                            "cannot load the checkpoint log record".to_owned(),
-                        ))
-                    }
-                    Some((_, recbuf)) => match bincode::deserialize::<FullLogRecord>(&recbuf) {
-                        Ok(FullLogRecord {
-                            payload: LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log)),
-                            ..
-                        }) => ckpt_log,
-                        Ok(_) => {
-                            return Err(Error::DataCorrupted(
-                                "last checkpoint pos points to non checkpoint record".to_owned(),
-                            ))
-                        }
-                        _ => {
-                            return Err(Error::DataCorrupted(
-                                "cannot deserialize the checkpoint log record".to_owned(),
-                            ))
-                        }
-                    },
-                };
+    pub fn read_checkpoint_record(
+        &self,
+        last_checkpoint_pos: LogPointer,
+    ) -> Result<Option<CheckpointLog>> {
+        if !is_invalid_lsn(last_checkpoint_pos) {
+            let reader = self.get_reader(last_checkpoint_pos)?;
+            match reader.read_record(last_checkpoint_pos)? {
+                None => Err(Error::DataCorrupted(
+                    "cannot load the checkpoint log record".to_owned(),
+                )),
+                Some((_, recbuf)) => match bincode::deserialize::<FullLogRecord>(&recbuf) {
+                    Ok(FullLogRecord {
+                        payload: LogRecord::Wal(WalLogRecord::Checkpoint(ckpt_log)),
+                        ..
+                    }) => Ok(Some(ckpt_log)),
+                    Ok(_) => Err(Error::DataCorrupted(
+                        "last checkpoint pos points to non checkpoint record".to_owned(),
+                    )),
+                    _ => Err(Error::DataCorrupted(
+                        "cannot deserialize the checkpoint log record".to_owned(),
+                    )),
+                },
+            }
+        } else {
+            Ok(None)
+        }
+    }
 
-                db.get_state_manager().set_next_oid(checkpoint_log.next_oid);
-                db.get_transaction_manager()
-                    .set_next_xid(checkpoint_log.next_xid);
-                checkpoint_log.redo_pos
-            } else {
-                0
+    pub fn replay_logs(&self, db: &DB, redo_pos: LogPointer) -> Result<()> {
+        let reader = self.get_reader(redo_pos)?;
+        for rec in reader.iter() {
+            // this is the main redo apply loop
+            let (lsn, recbuf) = rec?;
+            let (xid, redo) = match bincode::deserialize::<FullLogRecord>(&recbuf) {
+                Ok(FullLogRecord { xid, payload }) => (xid, payload),
+                _ => {
+                    return Err(Error::DataCorrupted(
+                        "invalid log record during recovery".to_owned(),
+                    ))
+                }
             };
 
-            let current_lsn = self.current_lsn();
-            if current_lsn < redo_pos {
-                return Err(Error::DataCorrupted(
-                    "invalid redo point in checkpoint record".to_owned(),
-                ));
-            }
+            db.get_transaction_manager().advance_next_xid_past(xid);
+            redo.apply(db, xid, lsn)?;
+        }
 
-            let need_recovery =
-                current_lsn > redo_pos || master_record.db_state != DBState::Shutdowned;
-
-            if need_recovery {
-                ckptmgr.set_db_state(DBState::InCrashRecovery)?;
-
-                let reader = self.get_reader(redo_pos)?;
-                for rec in reader.iter() {
-                    // this is the main redo apply loop
-                    let (lsn, recbuf) = rec?;
-                    let (xid, redo) = match bincode::deserialize::<FullLogRecord>(&recbuf) {
-                        Ok(FullLogRecord { xid, payload }) => (xid, payload),
-                        _ => {
-                            return Err(Error::DataCorrupted(
-                                "invalid log record during recovery".to_owned(),
-                            ))
-                        }
-                    };
-
-                    db.get_transaction_manager().advance_next_xid_past(xid);
-                    redo.apply(db, xid, lsn)?;
-                }
-            }
-            Ok(())
-        })
+        Ok(())
     }
 }
 

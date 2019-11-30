@@ -1,10 +1,13 @@
 mod state_manager;
 mod transaction_log;
 mod transaction_manager;
+mod transaction_table;
 
 pub use self::{
-    state_manager::StateManager, transaction_log::TransactionLogRecord,
+    state_manager::StateManager,
+    transaction_log::TransactionLogRecord,
     transaction_manager::TransactionManager,
+    transaction_table::{TransactionStatus, TransactionTable},
 };
 
 pub type XID = u32;
@@ -21,13 +24,6 @@ pub fn compare_xid(a: XID, b: XID) -> std::cmp::Ordering {
         delta.cmp(&0)
     }
 }
-
-// #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// pub enum TransactionState {
-//     InProgress,
-//     Commit,
-//     Abort,
-// }
 
 pub struct Transaction {
     xid: XID,

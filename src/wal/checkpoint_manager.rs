@@ -45,6 +45,15 @@ impl Default for MasterRecord {
     }
 }
 
+impl MasterRecord {
+    pub fn db_state(&self) -> DBState {
+        self.db_state
+    }
+    pub fn last_checkpoint_pos(&self) -> LogPointer {
+        self.last_checkpoint_pos
+    }
+}
+
 struct MasterRecordFile {
     file_path: PathBuf,
 }
@@ -141,6 +150,9 @@ impl CheckpointManager {
         // record all information needed for the checkpoint
         let next_oid = db.get_state_manager().max_allocated_oid();
         let next_xid = db.get_transaction_manager().read_next_id();
+
+        // write in-memory states
+        db.get_transaction_manager().checkpoint()?;
 
         // sync all buffers
         let bufmgr = db.get_buffer_manager();

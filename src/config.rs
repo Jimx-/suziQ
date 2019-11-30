@@ -52,6 +52,12 @@ impl DBConfig {
         path
     }
 
+    pub fn get_transaction_path(&self) -> PathBuf {
+        let mut path = self.root_path.clone();
+        path.push("txn");
+        path
+    }
+
     pub fn get_master_record_path(&self) -> PathBuf {
         let mut path = self.root_path.clone();
         path.push("master_record");
