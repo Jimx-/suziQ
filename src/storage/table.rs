@@ -39,7 +39,11 @@ pub trait Table: Relation {
 
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer>;
 
-    fn begin_scan<'a>(&'a self, db: &DB) -> Result<Box<dyn TableScanIterator<'a> + 'a>>;
+    fn begin_scan<'a>(
+        &'a self,
+        db: &DB,
+        txn: &'a mut Transaction,
+    ) -> Result<Box<dyn TableScanIterator<'a> + 'a>>;
 }
 
 pub type TablePtr = Arc<dyn Table>;

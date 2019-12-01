@@ -1,5 +1,5 @@
 use crate::{
-    concurrency::{is_invalid_xid, TransactionLogRecord, XID},
+    concurrency::{TransactionLogRecord, XID},
     Error, Result, DB,
 };
 
@@ -20,11 +20,13 @@ const TXNS_PER_PAGE: usize = TXNS_PER_BYTE * TRANSACTION_PAGE_SIZE;
 
 #[inline(always)]
 fn transaction_to_page_num(xid: XID) -> usize {
+    let xid: u64 = xid.into();
     xid as usize / TXNS_PER_PAGE
 }
 
 #[inline(always)]
 fn transaction_to_page_index(xid: XID) -> usize {
+    let xid: u64 = xid.into();
     xid as usize % TXNS_PER_PAGE
 }
 
@@ -209,7 +211,7 @@ impl TransactionTable {
     }
 
     pub fn extend(&mut self, db: &DB, xid: XID) -> Result<()> {
-        if is_invalid_xid(xid) || transaction_to_page_index(xid) != 0 {
+        if xid.is_invalid() || transaction_to_page_index(xid) != 0 {
             Ok(())
         } else {
             let page_num = transaction_to_page_num(xid);
@@ -219,7 +221,7 @@ impl TransactionTable {
             // write log records only when extending the table
             // transaction statuses will be handled by commit log records
             let zero_page_log = TransactionLogRecord::create_transaction_zero_page_log(page_num);
-            db.get_wal().append(0, zero_page_log)?;
+            db.get_wal().append(XID::default(), zero_page_log)?;
             // no flush here because log records with XIDs in the extended page must be after this zero page record
             Ok(())
         }
@@ -278,7 +280,7 @@ impl TransactionTable {
         Ok(())
     }
 
-    pub fn redo_table_zero_page(&mut self, page_num: usize) -> Result<()> {
+    pub fn redo_zero_page(&mut self, page_num: usize) -> Result<()> {
         let page = self.new_page(page_num)?;
         self.write_page(page_num, &page)?;
         self.put_page(page);
@@ -297,13 +299,13 @@ mod tests {
 
         for i in 0..100 {
             assert!(table
-                .set_transaction_status(i as XID, TransactionStatus::from(i % 4))
+                .set_transaction_status(XID::from(i), TransactionStatus::from(i as u8 % 4))
                 .is_ok());
         }
 
         for i in 0..100 {
-            let status = table.get_transaction_status(i as XID).unwrap();
-            assert_eq!(TransactionStatus::from(i % 4), status);
+            let status = table.get_transaction_status(XID::from(i)).unwrap();
+            assert_eq!(TransactionStatus::from(i as u8 % 4), status);
         }
 
         file.close().unwrap();

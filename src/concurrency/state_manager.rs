@@ -1,4 +1,4 @@
-use crate::{wal::WalLogRecord, Result, DB, OID};
+use crate::{concurrency::XID, wal::WalLogRecord, Result, DB, OID};
 
 use std::sync::Mutex;
 
@@ -44,7 +44,7 @@ impl StateManager {
             let wal = db.get_wal();
             let next_oid_log =
                 WalLogRecord::create_next_oid_log(guard.next_oid + OID_PREALLOC_COUNT as OID);
-            wal.append(0, next_oid_log)?;
+            wal.append(XID::default(), next_oid_log)?;
             guard.oid_count = OID_PREALLOC_COUNT;
         }
 

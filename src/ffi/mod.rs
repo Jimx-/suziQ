@@ -221,6 +221,7 @@ pub extern "C" fn sq_table_insert_tuple(
 pub extern "C" fn sq_table_begin_scan<'a>(
     table: *const TablePtr,
     db: *const DB,
+    txn: *mut Transaction,
 ) -> *mut Box<dyn TableScanIterator<'a> + 'a> {
     let db = unsafe {
         assert!(!db.is_null());
@@ -230,8 +231,12 @@ pub extern "C" fn sq_table_begin_scan<'a>(
         assert!(!table.is_null());
         &*table
     };
+    let txn: &mut Transaction = unsafe {
+        assert!(!txn.is_null());
+        &mut *txn
+    };
 
-    let iterator = match table.begin_scan(db) {
+    let iterator = match table.begin_scan(db, txn) {
         Ok(iterator) => iterator,
         Err(e) => {
             update_last_error(e);

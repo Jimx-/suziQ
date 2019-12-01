@@ -1,6 +1,6 @@
 use crate::{
     concurrency::{
-        compare_xid, is_invalid_xid, Transaction, TransactionLogRecord, TransactionStatus,
+        IsolationLevel, Snapshot, Transaction, TransactionLogRecord, TransactionStatus,
         TransactionTable, XID,
     },
     wal::LogPointer,
@@ -8,16 +8,31 @@ use crate::{
 };
 
 use std::{
-    cmp::Ordering,
+    collections::HashSet,
     fs::DirBuilder,
     path::{Path, PathBuf},
     sync::Mutex,
     time::SystemTime,
 };
 
+struct SnapshotData {
+    active_xids: HashSet<XID>,
+    latest_completed_xid: XID,
+}
+
+impl Default for SnapshotData {
+    fn default() -> Self {
+        Self {
+            active_xids: HashSet::new(),
+            latest_completed_xid: XID::default(),
+        }
+    }
+}
+
 pub struct TransactionManager {
     next_xid: Mutex<XID>,
     txn_table: Mutex<TransactionTable>,
+    snapshot_data: Mutex<SnapshotData>,
 }
 
 impl TransactionManager {
@@ -33,9 +48,12 @@ impl TransactionManager {
 
         let txn_table = TransactionTable::open(Self::get_txn_table_path(path))?;
 
+        let snapshot_data = Default::default();
+
         let txnmgr = Self {
-            next_xid: Mutex::new(1),
+            next_xid: Mutex::new(XID::default().inc()),
             txn_table: Mutex::new(txn_table),
+            snapshot_data: Mutex::new(snapshot_data),
         };
 
         Ok(txnmgr)
@@ -43,15 +61,25 @@ impl TransactionManager {
 
     pub fn init_state(&self) {
         let guard = self.next_xid.lock().unwrap();
-        let mut table_guard = self.txn_table.lock().unwrap();
 
+        {
+            let mut snapshot_guard = self.snapshot_data.lock().unwrap();
+            snapshot_guard.latest_completed_xid = (*guard).dec();
+        }
+
+        let mut table_guard = self.txn_table.lock().unwrap();
         table_guard.init_state(*guard);
     }
 
     pub fn start_transaction(&self, db: &DB) -> Result<Transaction> {
         let xid = self.get_next_xid(db)?;
 
-        Ok(Transaction::new(xid))
+        {
+            let mut guard = self.snapshot_data.lock().unwrap();
+            guard.active_xids.insert(xid);
+        }
+
+        Ok(Transaction::new(xid, IsolationLevel::ReadCommitted))
     }
 
     pub fn commit_transaction(&self, db: &DB, txn: Transaction) -> Result<()> {
@@ -72,7 +100,69 @@ impl TransactionManager {
             guard.set_transaction_status(xid, TransactionStatus::Committed)?;
         }
 
+        self.mark_transaction_end(xid);
+
         Ok(())
+    }
+
+    pub fn get_snapshot<'a>(&self, txn: &'a mut Transaction) -> Result<&'a Snapshot> {
+        let snapshot = txn.current_snapshot.take();
+        match snapshot {
+            None => {
+                // first call
+                let snapshot = self.record_snapshot(txn)?;
+                txn.current_snapshot = Some(snapshot);
+            }
+            Some(snapshot) => {
+                if txn.uses_transaction_snapshot() {
+                    // for repeatable read, always use the first snapshot
+                    txn.current_snapshot = Some(snapshot);
+                } else {
+                    let snapshot = self.record_snapshot(txn)?;
+                    txn.current_snapshot = Some(snapshot);
+                }
+            }
+        };
+
+        match &txn.current_snapshot {
+            Some(snapshot) => Ok(snapshot),
+            _ => unreachable!(),
+        }
+    }
+
+    fn record_snapshot(&self, txn: &Transaction) -> Result<Snapshot> {
+        let guard = self.snapshot_data.lock().unwrap();
+
+        let max_xid = guard.latest_completed_xid.inc();
+        let mut min_xid = max_xid;
+        let mut xips = HashSet::new();
+
+        for xid in guard.active_xids.iter().copied() {
+            if xid.is_invalid() {
+                panic!("invalid XID in active transaction list");
+            }
+
+            if xid >= max_xid {
+                continue;
+            }
+
+            if xid < min_xid {
+                min_xid = xid;
+            }
+
+            if xid == txn.xid() {
+                continue;
+            }
+
+            xips.insert(xid);
+        }
+
+        let snapshot = Snapshot {
+            min_xid,
+            max_xid,
+            xips,
+        };
+        Ok(snapshot)
     }
 
     fn get_next_xid(&self, db: &DB) -> Result<XID> {
@@ -84,14 +174,7 @@ impl TransactionManager {
             table_guard.extend(db, xid)?;
         }
 
-        loop {
-            *guard += 1;
-
-            if !is_invalid_xid(*guard) {
-                break;
-            }
-        }
-
+        *guard = (*guard).inc();
         Ok(xid)
     }
 
@@ -108,20 +191,15 @@ impl TransactionManager {
     pub fn advance_next_xid_past(&self, xid: XID) {
         let mut guard = self.next_xid.lock().unwrap();
 
-        match compare_xid(xid, *guard) {
-            Ordering::Greater | Ordering::Equal => {
-                let mut xid = xid;
-                loop {
-                    xid += 1;
-
-                    if !is_invalid_xid(xid) {
-                        break;
-                    }
-                }
-                *guard = xid;
-            }
-            _ => {}
+        if xid >= *guard {
+            *guard = xid.inc();
         }
+    }
+
+    pub fn get_transaction_status(&self, xid: XID) -> Result<TransactionStatus> {
+        let mut guard = self.txn_table.lock().unwrap();
+
+        guard.get_transaction_status(xid)
     }
 
     pub fn checkpoint(&self) -> Result<()> {
@@ -139,7 +217,7 @@ impl TransactionManager {
         match redo {
             TransactionLogRecord::ZeroPage(zero_page_log) => {
                 let mut guard = self.txn_table.lock().unwrap();
-                guard.redo_table_zero_page(zero_page_log.page_num)
+                guard.redo_zero_page(zero_page_log.page_num)
             }
             TransactionLogRecord::Commit(commit_log) => {
                 self.redo_commit(db, xid, lsn, commit_log.commit_time)
@@ -168,5 +246,15 @@ impl TransactionManager {
         let mut dir = path.as_ref().to_path_buf();
         dir.push("txn_log");
         dir
+    }
+
+    fn mark_transaction_end(&self, xid: XID) {
+        let mut guard = self.snapshot_data.lock().unwrap();
+
+        guard.active_xids.remove(&xid); // XXX: sanity check
+
+        if guard.latest_completed_xid < xid {
+            guard.latest_completed_xid = xid;
+        }
     }
 }

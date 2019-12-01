@@ -5,6 +5,7 @@ pub mod storage;
 pub mod wal;
 
 extern crate bincode;
+extern crate bitflags;
 extern crate byteorder;
 extern crate fs2;
 extern crate log;

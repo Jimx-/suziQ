@@ -3,7 +3,7 @@ mod heap_page;
 
 use crate::{
     catalog::Schema,
-    concurrency::{Transaction, XID},
+    concurrency::{Snapshot, Transaction, TransactionStatus, XID},
     storage::{
         consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
         RelFileRef, RelationWithStorage, ScanDirection, StorageHandle, Table, TableData,
@@ -18,10 +18,20 @@ pub(crate) use self::heap_log::HeapLogRecord;
 
 use std::{borrow::Cow, sync::Mutex};
 
+use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
 fn tuple_size_limit() -> usize {
     PAGE_SIZE
+}
+
+bitflags! {
+    struct HeapTupleFlags: u32 {
+        const MIN_XID_COMMITTED = 0b00000001;
+        const MAX_XID_COMMITTED = 0b00000010;
+        const MIN_XID_INVALID = 0b00000100;
+        const MAX_XID_INVALID = 0b00001000;
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -31,6 +41,7 @@ struct HeapTuple<'a> {
     #[serde(skip)]
     ptr: Option<ItemPointer>,
 
+    flags: u32,
     min_xid: XID,
     max_xid: XID,
     #[serde(borrow)]
@@ -42,8 +53,9 @@ impl<'a> HeapTuple<'a> {
         Self {
             table_id,
             ptr: None,
-            min_xid: 0,
-            max_xid: 0,
+            flags: 0,
+            min_xid: XID::default(),
+            max_xid: XID::default(),
             data: data.into(),
         }
     }
@@ -56,10 +68,91 @@ impl<'a> HeapTuple<'a> {
         HeapTuple {
             table_id: self.table_id,
             ptr: self.ptr,
+            flags: 0,
             min_xid: self.min_xid,
             max_xid: self.max_xid,
             data: Cow::from(self.data.to_vec()),
         }
+    }
+
+    /// Test if the heap tuple is visible for the given snapshot
+    fn is_visible(&self, db: &DB, snapshot: &Snapshot, current_xid: XID) -> Result<(bool, u32)> {
+        let flags = HeapTupleFlags::from_bits_truncate(self.flags);
+        let mut new_flags = HeapTupleFlags::empty();
+
+        if !flags.contains(HeapTupleFlags::MIN_XID_COMMITTED) {
+            if self.min_xid.is_invalid() {
+                return Ok((false, 0));
+            } else if self.min_xid == current_xid {
+                if flags.contains(HeapTupleFlags::MAX_XID_INVALID) {
+                    // not deleted
+                    return Ok((true, 0));
+                }
+
+                if self.max_xid != current_xid {
+                    // impossible (delete a tuple inserted by an in-progress transaction)
+                    return Ok((false, HeapTupleFlags::MAX_XID_INVALID.bits()));
+                }
+
+                // the tuple is deleted by the current transaction
+                return Ok((false, 0)); // XXX: determine whether the tuple is deleted before or after the scan
+            } else if snapshot.is_xid_in_progress(self.min_xid) {
+                // inserted by another in-progress transaction
+                return Ok((false, 0));
+            }
+            // by here, the inserting transaction must be committed or aborted
+            else if db
+                .get_transaction_manager()
+                .get_transaction_status(self.min_xid)?
+                == TransactionStatus::Committed
+            {
+                new_flags |= HeapTupleFlags::MIN_XID_COMMITTED;
+            } else {
+                // the transaction that inserts the tuple must be aborted
+                return Ok((false, HeapTupleFlags::MIN_XID_INVALID.bits()));
+            }
+        } else {
+            // the transaction is marked committed but is in-progress according to the snapshot
+            if snapshot.is_xid_in_progress(self.min_xid) {
+                return Ok((false, 0));
+            }
+        }
+
+        // by here, the inserting transaction is committed
+        if flags.contains(HeapTupleFlags::MAX_XID_INVALID) {
+            // the transaction that deletes the tuple is invalid or aborted
+            return Ok((true, new_flags.bits()));
+        }
+
+        if !flags.contains(HeapTupleFlags::MAX_XID_COMMITTED) {
+            if self.max_xid == current_xid {
+                return Ok((false, new_flags.bits())); // XXX: determine whether the tuple is deleted before or after the scan
+            }
+
+            if snapshot.is_xid_in_progress(self.max_xid) {
+                // the deleting transaction is still in-progress
+                return Ok((true, new_flags.bits()));
+            }
+
+            if db
+                .get_transaction_manager()
+                .get_transaction_status(self.max_xid)?
+                != TransactionStatus::Committed
+            {
+                // the deleting transaction is aborted
+                return Ok((true, HeapTupleFlags::MAX_XID_INVALID.bits()));
+            } else {
+                return Ok((false, HeapTupleFlags::MAX_XID_COMMITTED.bits()));
+            }
+        } else {
+            // the deleting transaction is committed but is in-progress in the snapshot
+            if snapshot.is_xid_in_progress(self.max_xid) {
+                return Ok((true, new_flags.bits()));
+            }
+        }
+
+        // the deleteing transaction is committed
+        return Ok((false, new_flags.bits()));
     }
 }
 
@@ -120,7 +213,9 @@ impl Heap {
 
     fn prepare_heap_tuple_for_insert<'a>(&self, xid: XID, data: &'a [u8]) -> HeapTuple<'a> {
         let mut htup = HeapTuple::new(self.rel_id(), data).materialize();
+        let flags = HeapTupleFlags::MAX_XID_INVALID;
         htup.min_xid = xid;
+        htup.flags = flags.bits();
         htup
     }
 
@@ -303,34 +398,86 @@ impl Heap {
         loop {
             match &iterator.cur_page {
                 Some(page) => {
-                    match HeapPageView::with_page(page, |page_view| {
-                        if remaining_tuples > 0 {
+                    match HeapPageViewMut::with_page(page, |page_view| {
+                        let mut remaining_tuples = remaining_tuples;
+                        let mut offset = offset;
+                        let mut dirty = false;
+
+                        while remaining_tuples > 0 {
                             let line_ptr = page_view.get_line_pointer(offset);
-                            let item = page_view.get_item(line_ptr);
-                            let htup_buf = unsafe {
-                                // extend the lifetime of buf to 'a
-                                // this is ok because we keep a pinned page in the scan iterator
-                                // so the page buffer will be valid until the next iteration
-                                std::mem::transmute::<&[u8], &'a [u8]>(item)
-                            };
 
-                            let mut htup = match bincode::deserialize::<HeapTuple>(htup_buf) {
-                                Ok(htup) => htup,
-                                _ => {
-                                    return Err(Error::DataCorrupted(
-                                        "cannot deserialize heap tuple".to_owned(),
-                                    ));
+                            let valid = {
+                                let item = page_view.get_item(line_ptr);
+                                // deserialize the tuple to check visibility
+                                let mut htup = match bincode::deserialize::<HeapTuple>(item) {
+                                    Ok(htup) => htup,
+                                    _ => {
+                                        return Err(Error::DataCorrupted(
+                                            "cannot deserialize heap tuple".to_owned(),
+                                        ));
+                                    }
+                                };
+
+                                let (valid, new_flags) =
+                                    htup.is_visible(db, iterator.snapshot, iterator.xid)?;
+
+                                if new_flags != 0 {
+                                    // install the new hint bits to the page
+                                    // XXX: If we set the hint bits that some transactions are
+                                    //      committed, we should also set the page LSN to the
+                                    //      latest commit LSNs of those transactions. This is
+                                    //      to make sure that this page is written to disk
+                                    //      only after the commit log records are written.
+                                    //      Otherwise, the page may contain invalid bits if
+                                    //      the transactions are marked committed but the
+                                    //      commit log records are not written. (can this really
+                                    //      happen?)
+                                    htup.flags |= new_flags;
+                                    let htup_buf = bincode::serialize(&htup).unwrap();
+                                    page_view.set_item(&htup_buf, line_ptr)?;
+                                    dirty = true;
                                 }
+
+                                valid
                             };
 
-                            htup.table_id = self.rel_id();
-                            htup.set_pointer(ItemPointer::new(iterator.cur_page_num, offset));
+                            if valid {
+                                let item = page_view.get_item(line_ptr);
+                                let htup_buf = unsafe {
+                                    // extend the lifetime of buf to 'a
+                                    // this is ok because we keep a pinned page in the scan iterator
+                                    // so the page buffer will be valid until the next iteration
+                                    std::mem::transmute::<&[u8], &'a [u8]>(item)
+                                };
 
-                            Ok(Some(htup))
-                        } else {
-                            // we've scanned all tuples on the current page, go to the next page
-                            Ok(None)
+                                let mut htup = match bincode::deserialize::<HeapTuple>(htup_buf) {
+                                    Ok(htup) => htup,
+                                    _ => {
+                                        return Err(Error::DataCorrupted(
+                                            "cannot deserialize heap tuple".to_owned(),
+                                        ));
+                                    }
+                                };
+
+                                htup.table_id = self.rel_id();
+                                htup.set_pointer(ItemPointer::new(iterator.cur_page_num, offset));
+
+                                return Ok((dirty, Some(htup)));
+                            }
+
+                            remaining_tuples -= 1;
+
+                            match dir {
+                                ScanDirection::Forward => {
+                                    offset += 1;
+                                }
+                                ScanDirection::Backward => {
+                                    offset -= 1;
+                                }
+                            }
                         }
+                        // we've scanned all tuples on the current page, go to the next page
+                        Ok((dirty, None))
                     })? {
                         Some(htup) => {
                             iterator.tuple = htup;
@@ -427,6 +574,8 @@ impl Relation for Heap {
 
 pub struct HeapScanIterator<'a> {
     heap: &'a Heap,
+    xid: XID,
+    snapshot: &'a Snapshot,
     inited: bool,
     tuple: HeapTuple<'a>,
     cur_page: Option<PinnedPagePtr>,
@@ -494,6 +643,7 @@ impl Table for Heap {
                 ForkType::Main,
                 page_num,
                 off,
+                htup.flags,
                 tuple,
             );
             let (_, lsn) = db.get_wal().append(txn.xid(), insert_log)?;
@@ -503,11 +653,19 @@ impl Table for Heap {
         Ok(itemp)
     }
 
-    fn begin_scan<'a>(&'a self, db: &DB) -> Result<Box<dyn TableScanIterator<'a> + 'a>> {
+    fn begin_scan<'a>(
+        &'a self,
+        db: &DB,
+        txn: &'a mut Transaction,
+    ) -> Result<Box<dyn TableScanIterator<'a> + 'a>> {
         let smgr = db.get_storage_manager();
         let heap_pages = self.get_size_in_page(smgr)?;
+        let xid = txn.xid();
+        let snapshot = db.get_transaction_manager().get_snapshot(txn)?;
         let heap_it = HeapScanIterator {
             heap: &self,
+            xid,
+            snapshot,
             inited: false,
             tuple: HeapTuple::new(self.rel_id(), &[]).materialize(),
             cur_page: None,
@@ -549,7 +707,7 @@ mod tests {
     #[test]
     fn can_insert_and_scan_heap() {
         let (db, db_dir) = get_temp_db();
-        let txn = db.start_transaction().unwrap();
+        let mut txn = db.start_transaction().unwrap();
         let heap = db.create_table(0, 0, Schema::new()).unwrap();
 
         let data: &[u8] = &[1u8; 100];
@@ -557,23 +715,25 @@ mod tests {
             assert!(heap.insert_tuple(&db, &txn, data).is_ok());
         }
 
+        {
+            let mut iter = heap.begin_scan(&db, &mut txn).unwrap();
+
+            let mut count = 0;
+            while let Some(tuple) = iter.next(&db, ScanDirection::Forward).unwrap() {
+                assert_eq!(tuple.get_data(), data);
+                count += 1;
+            }
+            assert_eq!(count, 100);
+
+            let mut count = 0;
+            while let Some(tuple) = iter.next(&db, ScanDirection::Backward).unwrap() {
+                assert_eq!(tuple.get_data(), data);
+                count += 1;
+            }
+            assert_eq!(count, 100);
+        }
+
         db.commit_transaction(txn).unwrap();
-
-        let mut iter = heap.begin_scan(&db).unwrap();
-
-        let mut count = 0;
-        while let Some(tuple) = iter.next(&db, ScanDirection::Forward).unwrap() {
-            assert_eq!(tuple.get_data(), data);
-            count += 1;
-        }
-        assert_eq!(count, 100);
-
-        let mut count = 0;
-        while let Some(tuple) = iter.next(&db, ScanDirection::Backward).unwrap() {
-            assert_eq!(tuple.get_data(), data);
-            count += 1;
-        }
-        assert_eq!(count, 100);
 
         assert!(db_dir.close().is_ok());
     }

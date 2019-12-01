@@ -39,7 +39,7 @@ impl Default for MasterRecord {
             db_state: DBState::Shutdowned,
             last_checkpoint_pos: 0,
             next_oid: 0,
-            next_xid: 1,
+            next_xid: XID::default().inc(),
             time: SystemTime::now(),
         }
     }
@@ -160,7 +160,7 @@ impl CheckpointManager {
 
         // write checkpoint log
         let checkpoint_log = WalLogRecord::create_checkpoint_log(redo_lsn, next_oid, next_xid);
-        let (checkpoint, checkpoint_lsn) = wal.append(0, checkpoint_log)?;
+        let (checkpoint, checkpoint_lsn) = wal.append(XID::default(), checkpoint_log)?;
         wal.flush(Some(checkpoint_lsn))?;
 
         // update the master record

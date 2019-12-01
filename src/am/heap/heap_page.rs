@@ -186,6 +186,36 @@ impl<'a> HeapPageViewMut<'a> {
 
         Ok(offset)
     }
+
+    pub fn set_item(&mut self, tuple: &[u8], lp: LinePointer) -> Result<()> {
+        let LinePointer { off, len } = lp;
+
+        if len as usize != tuple.len() {
+            return Err(Error::InvalidArgument(
+                "tuple size does not match".to_owned(),
+            ));
+        }
+        (&mut self.get_disk_page_payload_mut()[off as usize..off as usize + len as usize])
+            .copy_from_slice(tuple);
+
+        Ok(())
+    }
+
+    pub fn with_page<F, R>(page: &PinnedPagePtr, f: F) -> Result<R>
+    where
+        F: Copy + FnOnce(&mut HeapPageViewMut) -> Result<(bool, R)>,
+    {
+        page.with_write(|page| {
+            let buffer = page.buffer_mut();
+            let mut page_view = HeapPageViewMut::new(buffer);
+
+            let (dirty, result) = f(&mut page_view)?;
+            if dirty {
+                page.set_dirty(true);
+            }
+            Ok(result)
+        })
+    }
 }
 
 impl<'a> DiskPageReader for HeapPageViewMut<'a> {

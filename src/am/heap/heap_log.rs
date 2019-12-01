@@ -18,6 +18,7 @@ pub struct HeapInsertLog<'a> {
     fork: ForkType,
     page_num: usize,
     offset: u16,
+    flags: u32,
     #[serde(with = "serde_bytes")]
     tuple_data: &'a [u8],
 }
@@ -48,6 +49,7 @@ impl<'a> HeapInsertLog<'a> {
             let RelFileRef { rel_id, .. } = self.file_ref;
             let mut htup = HeapTuple::new(rel_id, self.tuple_data).materialize();
             htup.min_xid = xid;
+            htup.flags = self.flags;
             let htup_buf = bincode::serialize(&htup).unwrap();
 
             page_view.put_tuple(&htup_buf, Some(self.offset as usize))?;
@@ -79,6 +81,7 @@ impl<'a> HeapLogRecord<'a> {
         fork: ForkType,
         page_num: usize,
         offset: usize,
+        flags: u32,
         tuple_data: &[u8],
     ) -> LogRecord {
         let heap_insert_record = HeapInsertLog {
@@ -86,6 +89,7 @@ impl<'a> HeapLogRecord<'a> {
             fork,
             page_num,
             offset: offset as u16,
+            flags,
             tuple_data,
         };
         LogRecord::create_heap_record(HeapLogRecord::HeapInsert(heap_insert_record))
