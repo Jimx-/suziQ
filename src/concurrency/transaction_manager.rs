@@ -71,7 +71,11 @@ impl TransactionManager {
         table_guard.init_state(*guard);
     }
 
-    pub fn start_transaction(&self, db: &DB) -> Result<Transaction> {
+    pub fn start_transaction(
+        &self,
+        db: &DB,
+        isolation_level: IsolationLevel,
+    ) -> Result<Transaction> {
         let xid = self.get_next_xid(db)?;
 
         {
@@ -79,7 +83,7 @@ impl TransactionManager {
             guard.active_xids.insert(xid);
         }
 
-        Ok(Transaction::new(xid, IsolationLevel::ReadCommitted))
+        Ok(Transaction::new(xid, isolation_level))
     }
 
     pub fn commit_transaction(&self, db: &DB, txn: Transaction) -> Result<()> {

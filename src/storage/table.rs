@@ -30,7 +30,7 @@ pub trait TableScanIterator<'a> {
     fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<Box<dyn Tuple + 'a>>>;
 }
 
-pub trait Table: Relation {
+pub trait Table: Relation + Sync + Send {
     fn get_table_data(&self) -> &TableData;
 
     fn table_schema(&self) -> &Schema {

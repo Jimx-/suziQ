@@ -27,10 +27,10 @@ fn tuple_size_limit() -> usize {
 
 bitflags! {
     struct HeapTupleFlags: u32 {
-        const MIN_XID_COMMITTED = 0b00000001;
-        const MAX_XID_COMMITTED = 0b00000010;
-        const MIN_XID_INVALID = 0b00000100;
-        const MAX_XID_INVALID = 0b00001000;
+        const MIN_XID_COMMITTED = 0b0000_0001;
+        const MAX_XID_COMMITTED = 0b0000_0010;
+        const MIN_XID_INVALID = 0b0000_0100;
+        const MAX_XID_INVALID = 0b0000_1000;
     }
 }
 
@@ -152,7 +152,7 @@ impl<'a> HeapTuple<'a> {
         }
 
         // the deleteing transaction is committed
-        return Ok((false, new_flags.bits()));
+        Ok((false, new_flags.bits()))
     }
 }
 
@@ -688,7 +688,12 @@ impl RelationWithStorage for Heap {
 
 #[cfg(test)]
 mod tests {
-    use crate::{catalog::Schema, storage::ScanDirection, test_util::get_temp_db};
+    use crate::{
+        catalog::Schema, concurrency::IsolationLevel, storage::ScanDirection,
+        test_util::get_temp_db,
+    };
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[test]
     fn can_create_heap() {
@@ -707,7 +712,7 @@ mod tests {
     #[test]
     fn can_insert_and_scan_heap() {
         let (db, db_dir) = get_temp_db();
-        let mut txn = db.start_transaction().unwrap();
+        let mut txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
         let heap = db.create_table(0, 0, Schema::new()).unwrap();
 
         let data: &[u8] = &[1u8; 100];
@@ -734,6 +739,158 @@ mod tests {
         }
 
         db.commit_transaction(txn).unwrap();
+
+        assert!(db_dir.close().is_ok());
+    }
+
+    #[test]
+    fn can_handle_read_committed() {
+        let (db, db_dir) = get_temp_db();
+        let db = Arc::new(db);
+        db.create_table(0, 0, Schema::new()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let db1 = db.clone();
+        let b1 = barrier.clone();
+        let data: &[u8] = &[1u8; 100];
+        let thread1 = thread::spawn(move || {
+            let txn = db1
+                .start_transaction(IsolationLevel::ReadCommitted)
+                .unwrap();
+
+            let heap = db1.open_table(0, 0).unwrap().expect("");
+            for _ in 0..100 {
+                assert!(heap.insert_tuple(&db1, &txn, data).is_ok());
+            }
+
+            b1.wait(); // unblock scanning thread
+            b1.wait(); // wait for scanning thread to finish the first scan
+
+            db1.commit_transaction(txn).unwrap();
+
+            b1.wait(); // unblock scanning thread
+        });
+
+        let db2 = db.clone();
+        let b2 = barrier.clone();
+        let thread2 = thread::spawn(move || {
+            let mut txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
+
+            let heap = db2.open_table(0, 0).unwrap().expect("");
+
+            b2.wait(); // wait for insert thread to insert the tuples
+
+            {
+                let mut iter = heap.begin_scan(&db2, &mut txn).unwrap();
+
+                let mut count = 0;
+                while let Some(tuple) = iter.next(&db2, ScanDirection::Forward).unwrap() {
+                    assert_eq!(tuple.get_data(), data);
+                    count += 1;
+                }
+                //inserting thread has not yet committed the transaction
+                assert_eq!(count, 0); // no dirty reads
+            }
+
+            b2.wait(); // unblock inserting thread
+            b2.wait(); // wait for inserting thread to commit the transaction
+
+            {
+                let mut iter = heap.begin_scan(&db2, &mut txn).unwrap();
+
+                let mut count = 0;
+                while let Some(tuple) = iter.next(&db2, ScanDirection::Forward).unwrap() {
+                    assert_eq!(tuple.get_data(), data);
+                    count += 1;
+                }
+                assert_eq!(count, 100); // inserting thread has committed the transaction
+            }
+
+            db2.commit_transaction(txn).unwrap();
+        });
+
+        thread1.join().unwrap();
+        thread2.join().unwrap();
+
+        assert!(db_dir.close().is_ok());
+    }
+
+    #[test]
+    fn can_handle_repeatable_read() {
+        let (db, db_dir) = get_temp_db();
+        let db = Arc::new(db);
+        db.create_table(0, 0, Schema::new()).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let db1 = db.clone();
+        let b1 = barrier.clone();
+        let data: &[u8] = &[1u8; 100];
+        let thread1 = thread::spawn(move || {
+            let txn = db1
+                .start_transaction(IsolationLevel::RepeatableRead)
+                .unwrap();
+
+            let heap = db1.open_table(0, 0).unwrap().expect("");
+            for _ in 0..100 {
+                assert!(heap.insert_tuple(&db1, &txn, data).is_ok());
+            }
+
+            b1.wait(); // unblock scanning thread
+            b1.wait(); // wait for scanning thread to finish the first scan
+
+            db1.commit_transaction(txn).unwrap();
+
+            b1.wait(); // unblock scanning thread
+        });
+
+        let db2 = db.clone();
+        let b2 = barrier.clone();
+        let thread2 = thread::spawn(move || {
+            let mut txn = db
+                .start_transaction(IsolationLevel::RepeatableRead)
+                .unwrap();
+
+            let heap = db2.open_table(0, 0).unwrap().expect("");
+
+            b2.wait(); // wait for insert thread to insert the tuples
+
+            {
+                let mut iter = heap.begin_scan(&db2, &mut txn).unwrap();
+
+                let mut count = 0;
+                while let Some(tuple) = iter.next(&db2, ScanDirection::Forward).unwrap() {
+                    assert_eq!(tuple.get_data(), data);
+                    count += 1;
+                }
+                // inserting thread has not yet committed the transaction
+                assert_eq!(count, 0); // no dirty reads
+            }
+
+            b2.wait(); // unblock inserting thread
+            b2.wait(); // wait for inserting thread to commit the transaction
+
+            {
+                let mut iter = heap.begin_scan(&db2, &mut txn).unwrap();
+
+                let mut count = 0;
+                while let Some(tuple) = iter.next(&db2, ScanDirection::Forward).unwrap() {
+                    assert_eq!(tuple.get_data(), data);
+                    count += 1;
+                }
+                // inserting thread has committed the transaction
+                assert_eq!(count, 0); // no phantom reads
+                                      // Actually repeatable read allows phantom reads,
+                                      // but we are following PostgreSQL's implementation
+                                      // which disallows it.
+            }
+
+            db2.commit_transaction(txn).unwrap();
+        });
+
+        thread1.join().unwrap();
+        thread2.join().unwrap();
 
         assert!(db_dir.close().is_ok());
     }

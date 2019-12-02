@@ -3,16 +3,16 @@ extern crate libc;
 
 use crate::{
     catalog::Schema,
-    concurrency::Transaction,
+    concurrency::{IsolationLevel, Transaction},
     storage::{ScanDirection, TablePtr, TableScanIterator, Tuple},
-    DBConfig, Error, DB, OID,
+    DBConfig, Error, Result, DB, OID,
 };
 
 use libc::{c_char, c_int};
 use std::{cell::RefCell, ffi::CStr, path::PathBuf, sync::Arc};
 
 #[no_mangle]
-pub unsafe extern "C" fn sq_init() {
+pub extern "C" fn sq_init() {
     env_logger::init();
 }
 
@@ -86,6 +86,7 @@ pub extern "C" fn sq_create_db(root_path: *const c_char) -> *const DB {
     };
     Arc::into_raw(Arc::new(db))
 }
+
 #[no_mangle]
 pub extern "C" fn sq_free_db(db: *const DB) {
     if db.is_null() {
@@ -96,14 +97,32 @@ pub extern "C" fn sq_free_db(db: *const DB) {
     }
 }
 
+fn sq_get_isolation_level(isolation_level: c_int) -> Result<IsolationLevel> {
+    match isolation_level {
+        0 => Ok(IsolationLevel::ReadUncommitted),
+        1 => Ok(IsolationLevel::ReadCommitted),
+        2 => Ok(IsolationLevel::RepeatableRead),
+        3 => Ok(IsolationLevel::Serializable),
+        _ => Err(Error::InvalidArgument("unknown isolation level".to_owned())),
+    }
+}
+
 #[no_mangle]
-pub extern "C" fn sq_start_transaction(db: *const DB) -> *mut Transaction {
+pub extern "C" fn sq_start_transaction(db: *const DB, isolation_level: c_int) -> *mut Transaction {
     let db = unsafe {
         assert!(!db.is_null());
         &*db
     };
 
-    let txn = match db.start_transaction() {
+    let isolation_level = match sq_get_isolation_level(isolation_level) {
+        Ok(iso_level) => iso_level,
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    let txn = match db.start_transaction(isolation_level) {
         Ok(txn) => txn,
         Err(e) => {
             update_last_error(e);

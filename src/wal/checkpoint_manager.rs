@@ -195,12 +195,12 @@ impl CheckpointManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::{catalog::Schema, test_util::get_temp_db};
+    use crate::{catalog::Schema, concurrency::IsolationLevel, test_util::get_temp_db};
 
     #[test]
     fn can_create_checkpoint() {
         let (db, db_dir) = get_temp_db();
-        let txn = db.start_transaction().unwrap();
+        let txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
         let heap = db.create_table(0, 0, Schema::new()).unwrap();
 
         let data: &[u8] = &[1u8; 100];

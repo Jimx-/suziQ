@@ -8,7 +8,7 @@ use std::{
 use crate::{
     am::heap::Heap,
     catalog::{CatalogCache, Schema},
-    concurrency::{StateManager, Transaction, TransactionManager},
+    concurrency::{IsolationLevel, StateManager, Transaction, TransactionManager},
     storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
     wal::{CheckpointManager, DBState, Wal},
     Result,
@@ -128,8 +128,8 @@ impl DB {
         }
     }
 
-    pub fn start_transaction(&self) -> Result<Transaction> {
-        self.txnmgr.start_transaction(self)
+    pub fn start_transaction(&self, isolation_level: IsolationLevel) -> Result<Transaction> {
+        self.txnmgr.start_transaction(self, isolation_level)
     }
 
     pub fn commit_transaction(&self, txn: Transaction) -> Result<()> {
