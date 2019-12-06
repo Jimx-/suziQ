@@ -26,7 +26,6 @@ pub trait Index: Relation + Sync + Send {
     fn insert<'a>(
         &'a self,
         db: &DB,
-        txn: &Transaction,
         key: &[u8],
         key_comparator: &IndexKeyComparator,
         item_pointer: ItemPointer,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    am::{btree::BTree, heap::Heap, IndexPtr},
+    am::{btree::BTree, heap::Heap, Index, IndexPtr},
     catalog::{CatalogCache, Schema},
     concurrency::{IsolationLevel, StateManager, Transaction, TransactionManager},
     storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
@@ -132,8 +132,25 @@ impl DB {
         let mut guard = self.catalog_cache.lock().unwrap();
         let btree = Arc::new(BTree::new(rel_id, db));
         btree.create_storage(&self.smgr)?;
+        btree.build_empty(self)?;
         guard.add_index(btree.clone());
         Ok(btree)
+    }
+
+    pub fn open_index(&self, db: OID, rel_id: OID) -> Result<Option<IndexPtr>> {
+        let mut guard = self.catalog_cache.lock().unwrap();
+        match guard.lookup_index(rel_id) {
+            Some(index) => Ok(Some(index)),
+            None => {
+                if self.smgr.exists(db, rel_id, ForkType::Main)? {
+                    let index = Arc::new(BTree::new(rel_id, db));
+                    guard.add_index(index.clone());
+                    Ok(Some(index))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     pub fn start_transaction(&self, isolation_level: IsolationLevel) -> Result<Transaction> {

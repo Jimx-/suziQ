@@ -876,7 +876,6 @@ impl Index for BTree {
     fn insert<'a>(
         &'a self,
         db: &DB,
-        _txn: &Transaction,
         key: &[u8],
         key_comparator: &IndexKeyComparator,
         item_pointer: ItemPointer,
@@ -1135,9 +1134,7 @@ mod tests {
         for i in 0..300 {
             let key = make_key(300 - i);
             let item_ptr = heap.insert_tuple(&db, &txn, &key).unwrap();
-            assert!(btree
-                .insert(&db, &txn, &key, &key_comparator, item_ptr)
-                .is_ok());
+            assert!(btree.insert(&db, &key, &key_comparator, item_ptr).is_ok());
         }
 
         {

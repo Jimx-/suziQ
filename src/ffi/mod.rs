@@ -2,13 +2,14 @@ extern crate env_logger;
 extern crate libc;
 
 use crate::{
+    am::index::{IndexKeyComparator, IndexPtr},
     catalog::Schema,
     concurrency::{IsolationLevel, Transaction},
-    storage::{ScanDirection, TablePtr, TableScanIterator, Tuple},
+    storage::{ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
     DBConfig, Error, Result, DB, OID,
 };
 
-use libc::{c_char, c_int};
+use libc::{c_char, c_int, c_uint};
 use std::{cell::RefCell, ffi::CStr, path::PathBuf, sync::Arc};
 
 #[no_mangle]
@@ -205,13 +206,13 @@ pub extern "C" fn sq_free_table(table: *const TablePtr) {
 }
 
 #[no_mangle]
-pub extern "C" fn sq_table_insert_tuple(
+pub extern "C" fn sq_table_insert_tuple<'a>(
     table: *const TablePtr,
     db: *const DB,
     txn: *const Transaction,
     data: *const u8,
     len: u64,
-) -> c_int {
+) -> *const ItemPointer {
     let db = unsafe {
         assert!(!db.is_null());
         &*db
@@ -227,12 +228,24 @@ pub extern "C" fn sq_table_insert_tuple(
 
     let tuple = unsafe { std::slice::from_raw_parts(data, len as usize) };
 
-    match table.insert_tuple(db, txn, tuple) {
-        Ok(_) => 1,
+    let item_pointer = match table.insert_tuple(db, txn, tuple) {
+        Ok(ptr) => ptr,
         Err(e) => {
             update_last_error(e);
-            0
+            return std::ptr::null();
         }
+    };
+
+    Box::into_raw(Box::new(item_pointer))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_item_pointer(pointer: *const ItemPointer) {
+    if pointer.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(pointer as *mut ItemPointer);
     }
 }
 
@@ -391,4 +404,104 @@ pub extern "C" fn sq_get_next_oid(db: *const DB) -> OID {
             0
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_create_index(db: *const DB, db_oid: OID, rel_oid: OID) -> *const IndexPtr {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let index = match db.create_index(db_oid, rel_oid) {
+        Ok(index) => index,
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null();
+        }
+    };
+
+    Box::into_raw(Box::new(index))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_open_index(db: *const DB, db_oid: OID, rel_oid: OID) -> *const IndexPtr {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let index = match db.open_index(db_oid, rel_oid) {
+        Ok(Some(index)) => index,
+        Ok(None) => {
+            return std::ptr::null();
+        }
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null();
+        }
+    };
+
+    Box::into_raw(Box::new(index))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_index(index: *const IndexPtr) {
+    if index.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(index as *mut IndexPtr);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_index_insert(
+    db: *const DB,
+    index: *const IndexPtr,
+    key: *const u8,
+    length: c_int,
+    key_comparator_func: *const (),
+    item_pointer: *const ItemPointer,
+) {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let index = unsafe {
+        assert!(!index.is_null());
+        &*index
+    };
+
+    let item_pointer = unsafe {
+        assert!(!item_pointer.is_null());
+        *item_pointer
+    };
+
+    let key = unsafe { std::slice::from_raw_parts(key, length as usize) };
+
+    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
+        unsafe { std::mem::transmute(key_comparator_func) };
+
+    let key_comparator = IndexKeyComparator::new(|a: &[u8], b: &[u8]| {
+        let result =
+            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
+
+        match result {
+            -1 => Ok(std::cmp::Ordering::Less),
+            0 => Ok(std::cmp::Ordering::Equal),
+            1 => Ok(std::cmp::Ordering::Greater),
+            _ => Err(Error::InvalidArgument(
+                "cannot compare index keys".to_owned(),
+            )),
+        }
+    });
+
+    match index.insert(db, key, &key_comparator, item_pointer) {
+        Ok(_) => {}
+        Err(e) => {
+            update_last_error(e);
+        }
+    };
 }
