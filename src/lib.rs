@@ -13,6 +13,9 @@ extern crate lru;
 extern crate serde;
 extern crate serde_bytes;
 
+#[macro_use]
+extern crate rental;
+
 #[cfg(test)]
 extern crate tempfile;
 

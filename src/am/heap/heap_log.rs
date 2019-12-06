@@ -1,14 +1,13 @@
 use crate::{
     concurrency::XID,
-    storage::{DiskPageReader, DiskPageWriter, ForkType, RelFileRef},
+    storage::{
+        DiskPageReader, DiskPageWriter, ForkType, ItemPageReader, ItemPageWriter, RelFileRef,
+    },
     wal::{LogPointer, LogRecord},
     Result, DB,
 };
 
-use super::{
-    heap_page::{HeapPageReader, HeapPageViewMut},
-    HeapTuple,
-};
+use super::{heap_page::HeapPageViewMut, HeapTuple};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +51,7 @@ impl<'a> HeapInsertLog<'a> {
             htup.flags = self.flags;
             let htup_buf = bincode::serialize(&htup).unwrap();
 
-            page_view.put_tuple(&htup_buf, Some(self.offset as usize))?;
+            page_view.put_item(&htup_buf, Some(self.offset as usize), true)?;
 
             page_view.set_lsn(lsn);
             page.set_dirty(true);

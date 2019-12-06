@@ -49,9 +49,9 @@ impl PageCache {
         } else {
             match self.evict() {
                 Some(page_ptr) => {
-                    page_ptr.with_write(|page| {
+                    page_ptr.with_write(|mut page| {
                         if page.is_dirty() {
-                            Self::flush_page(db, page)?;
+                            Self::flush_page(db, &mut page)?;
                         }
 
                         page.set_fork_and_num(tag.0, tag.1, tag.2);

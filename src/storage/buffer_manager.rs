@@ -53,7 +53,7 @@ impl BufferManager {
         };
 
         for page_ptr in dirty_pages {
-            page_ptr.with_write(|page| PageCache::flush_page(db, page))?;
+            page_ptr.with_write(|mut page| PageCache::flush_page(db, &mut page))?;
             self.release_page(page_ptr)?;
         }
         Ok(())

@@ -5,14 +5,14 @@ use crate::{
     catalog::Schema,
     concurrency::{Snapshot, Transaction, TransactionStatus, XID},
     storage::{
-        consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPointer, PinnedPagePtr,
-        RelFileRef, RelationWithStorage, ScanDirection, StorageHandle, Table, TableData,
-        TableScanIterator, Tuple,
+        consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPageReader, ItemPageWriter,
+        ItemPointer, PinnedPagePtr, RelFileRef, RelationWithStorage, ScanDirection, StorageHandle,
+        Table, TableData, TableScanIterator, Tuple, TuplePtr,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
 
-use self::heap_page::{HeapPageReader, HeapPageView, HeapPageViewMut};
+use self::heap_page::{HeapPageView, HeapPageViewMut};
 
 pub(crate) use self::heap_log::HeapLogRecord;
 
@@ -166,6 +166,11 @@ impl<'a> Tuple for BufferHeapTuple<'a> {
     fn get_data(&self) -> &[u8] {
         &self.tuple.data
     }
+
+    fn get_item_pointer(&self) -> Option<ItemPointer> {
+        self.tuple.ptr
+    }
+
     fn materialize<'ret>(self: Box<Self>) -> Box<dyn Tuple + 'ret> {
         let tuple = BufferHeapTuple {
             tuple: self.tuple.materialize(),
@@ -336,12 +341,12 @@ impl Heap {
 
                     let page_num = iterator.start_page;
                     self.with_storage(smgr, |storage| iterator.fetch_page(db, storage, page_num))?;
-                    offset = 0;
+                    offset = 1;
                     iterator.inited = true;
                 } else {
                     // continue from last tuple
-                    let line_ptr = iterator.tuple.ptr.expect("impossible");
-                    let next_off = line_ptr.next_offset();
+                    let item_ptr = iterator.tuple.ptr.expect("impossible");
+                    let next_off = item_ptr.next();
                     offset = next_off.offset;
                 }
 
@@ -353,7 +358,7 @@ impl Heap {
                     }
                     Some(page) => {
                         remaining_tuples = HeapPageView::with_page(page, |page_view| {
-                            Ok(page_view.num_line_pointers() - offset)
+                            Ok(page_view.num_line_pointers() + 1 - offset)
                         })?;
                     }
                 }
@@ -374,21 +379,21 @@ impl Heap {
                     self.with_storage(smgr, |storage| iterator.fetch_page(db, storage, page_num))?;
                     remaining_tuples = iterator.num_tuples;
                     offset = if remaining_tuples > 0 {
-                        remaining_tuples - 1
+                        remaining_tuples
                     } else {
-                        0
+                        1
                     };
                     iterator.inited = true;
                 } else {
                     // continue from last tuple
-                    let line_ptr = iterator.tuple.ptr.expect("impossible");
-                    match line_ptr.prev_offset() {
+                    let item_ptr = iterator.tuple.ptr.expect("impossible");
+                    match item_ptr.prev() {
                         None => {
                             remaining_tuples = 0;
                         }
                         Some(prev_off) => {
                             offset = prev_off.offset;
-                            remaining_tuples = offset + 1;
+                            remaining_tuples = offset;
                         }
                     }
                 }
@@ -404,10 +409,8 @@ impl Heap {
                         let mut dirty = false;
 
                         while remaining_tuples > 0 {
-                            let line_ptr = page_view.get_line_pointer(offset);
-
                             let valid = {
-                                let item = page_view.get_item(line_ptr);
+                                let item = page_view.get_item(offset);
                                 // deserialize the tuple to check visibility
                                 let mut htup = match bincode::deserialize::<HeapTuple>(item) {
                                     Ok(htup) => htup,
@@ -434,7 +437,7 @@ impl Heap {
                                     //      happen?)
                                     htup.flags |= new_flags;
                                     let htup_buf = bincode::serialize(&htup).unwrap();
-                                    page_view.set_item(&htup_buf, line_ptr)?;
+                                    page_view.set_item(offset, &htup_buf)?;
                                     dirty = true;
                                 }
 
@@ -442,7 +445,7 @@ impl Heap {
                             };
 
                             if valid {
-                                let item = page_view.get_item(line_ptr);
+                                let item = page_view.get_item(offset);
                                 let htup_buf = unsafe {
                                     // extend the lifetime of buf to 'a
                                     // this is ok because we keep a pinned page in the scan iterator
@@ -549,10 +552,10 @@ impl Heap {
 
                             match dir {
                                 ScanDirection::Forward => {
-                                    offset = 0;
+                                    offset = 1;
                                 }
                                 ScanDirection::Backward => {
-                                    offset = remaining_tuples - 1;
+                                    offset = remaining_tuples;
                                 }
                             }
                         }
@@ -608,7 +611,7 @@ impl<'a> HeapScanIterator<'a> {
 }
 
 impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
-    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<Box<dyn Tuple + 'a>>> {
+    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<TuplePtr<'a>>> {
         if self.heap.get_next_tuple(db, self, dir)? {
             let buffer_tuple = BufferHeapTuple {
                 tuple: self.tuple.clone(),
@@ -633,7 +636,7 @@ impl Table for Heap {
         let htup_len = htup_buf.len();
 
         let itemp = self.with_page_for_tuple(db, htup_len, |page_view, page_num| {
-            let off = page_view.put_tuple(&htup_buf, None)?;
+            let off = page_view.put_item(&htup_buf, None, false)?;
             // create insert log
             let insert_log = HeapLogRecord::create_heap_insert_log(
                 RelFileRef {
@@ -677,6 +680,87 @@ impl Table for Heap {
         };
 
         Ok(Box::new(heap_it))
+    }
+
+    fn fetch_tuple<'a>(
+        &'a self,
+        db: &'a DB,
+        xid: XID,
+        snapshot: &Snapshot,
+        item_pointer: ItemPointer,
+    ) -> Result<Option<TuplePtr<'a>>> {
+        let ItemPointer { page_num, offset } = item_pointer;
+
+        self.with_storage(db.get_storage_manager(), |storage| {
+            let page_ptr =
+                db.get_buffer_manager()
+                    .fetch_page(db, storage, ForkType::Main, page_num)?;
+
+            let htup = HeapPageViewMut::with_page(&page_ptr, |page_view| {
+                let mut dirty = false;
+                let valid = {
+                    let item = page_view.get_item(offset);
+                    // deserialize the tuple to check visibility
+                    let mut htup = match bincode::deserialize::<HeapTuple>(item) {
+                        Ok(htup) => htup,
+                        _ => {
+                            return Err(Error::DataCorrupted(
+                                "cannot deserialize heap tuple".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let (valid, new_flags) = htup.is_visible(db, snapshot, xid)?;
+
+                    if new_flags != 0 {
+                        htup.flags |= new_flags;
+                        let htup_buf = bincode::serialize(&htup).unwrap();
+                        page_view.set_item(offset, &htup_buf)?;
+                        dirty = true;
+                    }
+
+                    valid
+                };
+
+                if valid {
+                    let item = page_view.get_item(offset);
+                    let htup_buf = unsafe {
+                        // extend the lifetime of buf to 'a
+                        // this is ok because we keep a pinned page in the scan iterator
+                        // so the page buffer will be valid until the next iteration
+                        std::mem::transmute::<&[u8], &'a [u8]>(item)
+                    };
+
+                    let mut htup = match bincode::deserialize::<HeapTuple>(htup_buf) {
+                        Ok(htup) => htup,
+                        _ => {
+                            return Err(Error::DataCorrupted(
+                                "cannot deserialize heap tuple".to_owned(),
+                            ));
+                        }
+                    };
+
+                    htup.table_id = self.rel_id();
+                    htup.set_pointer(item_pointer);
+
+                    Ok((dirty, Some(htup)))
+                } else {
+                    Ok((dirty, None))
+                }
+            })?;
+
+            match htup {
+                Some(htup) => {
+                    let buffer_tuple = BufferHeapTuple {
+                        tuple: htup,
+                        bufmgr: Some(db.get_buffer_manager()),
+                        page: Some(page_ptr),
+                    };
+                    Ok(Some(Box::new(buffer_tuple) as TuplePtr))
+                }
+                _ => Ok(None),
+            }
+        })
     }
 }
 

@@ -1,5 +1,8 @@
 use crate::{
-    catalog::Schema, concurrency::Transaction, storage::ItemPointer, Relation, Result, DB,
+    catalog::Schema,
+    concurrency::{Snapshot, Transaction, XID},
+    storage::ItemPointer,
+    Relation, Result, DB,
 };
 
 use std::sync::Arc;
@@ -22,12 +25,15 @@ pub enum ScanDirection {
 
 pub trait Tuple {
     fn get_data(&self) -> &[u8];
+    fn get_item_pointer(&self) -> Option<ItemPointer>;
     /// Materialize the tuple so that it does not depend on any underlying resource
     fn materialize<'ret>(self: Box<Self>) -> Box<dyn Tuple + 'ret>;
 }
 
+pub type TuplePtr<'a> = Box<dyn Tuple + 'a>;
+
 pub trait TableScanIterator<'a> {
-    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<Box<dyn Tuple + 'a>>>;
+    fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<TuplePtr<'a>>>;
 }
 
 pub trait Table: Relation + Sync + Send {
@@ -44,6 +50,14 @@ pub trait Table: Relation + Sync + Send {
         db: &DB,
         txn: &'a mut Transaction,
     ) -> Result<Box<dyn TableScanIterator<'a> + 'a>>;
+
+    fn fetch_tuple<'a>(
+        &'a self,
+        db: &'a DB,
+        xid: XID,
+        snapshot: &Snapshot,
+        item_pointer: ItemPointer,
+    ) -> Result<Option<TuplePtr<'a>>>;
 }
 
 pub type TablePtr = Arc<dyn Table>;

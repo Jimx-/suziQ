@@ -5,12 +5,12 @@ mod page_cache;
 mod storage_manager;
 mod table;
 
-use crate::{wal::LogPointer, Relation, Result, OID};
+use crate::{wal::LogPointer, Error, Relation, Result, OID};
 
 use std::{
     fmt,
-    ops::{Deref, DerefMut},
-    sync::{Arc, RwLock},
+    ops::Deref,
+    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
 use self::consts::PAGE_SIZE;
@@ -18,7 +18,7 @@ use self::consts::PAGE_SIZE;
 pub use self::{
     buffer_manager::BufferManager,
     storage_manager::{ForkType, StorageHandle, StorageManager},
-    table::{ScanDirection, Table, TableData, TablePtr, TableScanIterator, Tuple},
+    table::{ScanDirection, Table, TableData, TablePtr, TableScanIterator, Tuple, TuplePtr},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -101,6 +101,9 @@ impl Deref for PagePtr {
     }
 }
 
+pub type PageReadGuard<'a> = RwLockReadGuard<'a, Page>;
+pub type PageWriteGuard<'a> = RwLockWriteGuard<'a, Page>;
+
 impl PagePtr {
     pub fn new(file_ref: RelFileRef, fork: ForkType, page_num: usize, slot: usize) -> Self {
         Self(Arc::new(RwLock::new(Page {
@@ -119,7 +122,7 @@ impl PagePtr {
         F: Fn(&Page) -> Result<R>,
     {
         let guard = self.0.read().unwrap();
-        f(guard.deref())
+        f(&*guard)
     }
 
     pub fn with_write<F, R>(&self, f: F) -> Result<R>
@@ -127,7 +130,7 @@ impl PagePtr {
         F: FnOnce(&mut Page) -> Result<R>,
     {
         let mut guard = self.0.write().unwrap();
-        f(guard.deref_mut())
+        f(&mut *guard)
     }
 
     pub(self) fn pin(self) -> Result<(i32, PinnedPagePtr)> {
@@ -140,7 +143,7 @@ impl PagePtr {
         F: FnOnce(&Page) -> bool,
     {
         let pin_count =
-            self.with_write(|page| Ok(if f(page) { Some(page.pin()) } else { None }))?;
+            self.with_write(|page| Ok(if f(&page) { Some(page.pin()) } else { None }))?;
         Ok(pin_count.map(|pin_count| (pin_count, PinnedPagePtr(self))))
     }
 }
@@ -196,7 +199,7 @@ impl Clone for PinnedPagePtr {
     }
 }
 
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ItemPointer {
     pub page_num: usize,
     pub offset: usize,
@@ -207,15 +210,15 @@ impl ItemPointer {
         Self { page_num, offset }
     }
 
-    pub fn next_offset(&self) -> Self {
+    pub fn next(&self) -> Self {
         Self {
             page_num: self.page_num,
             offset: self.offset + 1,
         }
     }
 
-    pub fn prev_offset(&self) -> Option<Self> {
-        if self.offset == 0 {
+    pub fn prev(&self) -> Option<Self> {
+        if self.offset <= 1 {
             None
         } else {
             Some(Self {
@@ -297,5 +300,192 @@ impl<'a> DiskPageReader for DiskPageViewMut<'a> {
 impl<'a> DiskPageWriter for DiskPageViewMut<'a> {
     fn get_page_buffer_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
         self.buffer
+    }
+}
+
+const P_LOWER: usize = 0;
+const P_UPPER: usize = P_LOWER + 2;
+const P_POINTERS: usize = P_UPPER + 2;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LinePointer {
+    off: u16,
+    len: u16,
+}
+
+const LINE_POINTER_SIZE: usize = 4;
+
+/// Item-based interface for pages
+///
+/// The items in the page are indexed with an offset number which starts from 1.
+pub trait ItemPageReader {
+    fn get_item_page_payload(&self) -> &[u8];
+
+    fn get_lower(&self) -> u16 {
+        let buf = self.get_item_page_payload();
+        (&buf[P_LOWER..]).read_u16::<LittleEndian>().unwrap()
+    }
+
+    fn get_upper(&self) -> u16 {
+        let buf = self.get_item_page_payload();
+        (&buf[P_UPPER..]).read_u16::<LittleEndian>().unwrap()
+    }
+
+    fn is_new(&self) -> bool {
+        self.get_upper() == 0
+    }
+
+    fn get_free_space(&self) -> usize {
+        let size = self.get_upper() as usize - self.get_lower() as usize;
+
+        if size < LINE_POINTER_SIZE {
+            0
+        } else {
+            size - LINE_POINTER_SIZE
+        }
+    }
+
+    fn num_line_pointers(&self) -> usize {
+        let lower = self.get_lower() as usize;
+
+        if lower < P_POINTERS {
+            0
+        } else {
+            (lower - P_POINTERS) / LINE_POINTER_SIZE
+        }
+    }
+
+    fn get_line_pointer(&self, offset: usize) -> LinePointer {
+        let buf = self.get_item_page_payload();
+        let off = (&buf[P_POINTERS + (offset - 1) * LINE_POINTER_SIZE..])
+            .read_u16::<LittleEndian>()
+            .unwrap();
+        let len = (&buf[P_POINTERS + (offset - 1) * LINE_POINTER_SIZE + 2..])
+            .read_u16::<LittleEndian>()
+            .unwrap();
+
+        LinePointer { off, len }
+    }
+
+    fn get_item(&self, offset: usize) -> &[u8] {
+        let buf = self.get_item_page_payload();
+        let LinePointer { off, len } = self.get_line_pointer(offset);
+        &buf[off as usize..(off + len) as usize]
+    }
+
+    fn print_items(&self) {
+        for offset in 1..=self.num_line_pointers() {
+            let LinePointer { off, len } = self.get_line_pointer(offset);
+            println!("{}({}, {}): {:?}", offset, off, len, self.get_item(offset));
+        }
+    }
+}
+
+pub trait ItemPageWriter: ItemPageReader {
+    fn get_item_page_payload_mut(&mut self) -> &mut [u8];
+
+    fn set_lower(&mut self, lower: u16) {
+        (&mut self.get_item_page_payload_mut()[P_LOWER..])
+            .write_u16::<LittleEndian>(lower)
+            .unwrap();
+    }
+
+    fn set_upper(&mut self, upper: u16) {
+        (&mut self.get_item_page_payload_mut()[P_UPPER..])
+            .write_u16::<LittleEndian>(upper)
+            .unwrap();
+    }
+
+    fn init_item_page(&mut self) {
+        for i in self.get_item_page_payload_mut().iter_mut() {
+            *i = 0;
+        }
+
+        let buffer_len = self.get_item_page_payload_mut().len();
+        self.set_lower(P_POINTERS as u16);
+        self.set_upper(buffer_len as u16);
+    }
+
+    fn put_line_pointer(&mut self, offset: usize, lp: LinePointer) {
+        let buf = self.get_item_page_payload_mut();
+        (&mut buf[P_POINTERS + (offset - 1) * LINE_POINTER_SIZE..])
+            .write_u16::<LittleEndian>(lp.off)
+            .unwrap();
+        (&mut buf[P_POINTERS + (offset - 1) * LINE_POINTER_SIZE + 2..])
+            .write_u16::<LittleEndian>(lp.len)
+            .unwrap();
+    }
+
+    fn put_item(&mut self, item: &[u8], target: Option<usize>, overwrite: bool) -> Result<usize> {
+        let mut lower = self.get_lower();
+        let mut upper = self.get_upper();
+
+        if lower < P_POINTERS as u16
+            || lower > upper
+            || upper > self.get_item_page_payload_mut().len() as u16
+        {
+            return Err(Error::DataCorrupted(format!(
+                "heap page corrupted: lower = {}, upper = {}",
+                lower, upper
+            )));
+        }
+
+        upper -= item.len() as u16;
+        let lp = LinePointer {
+            off: upper,
+            len: item.len() as u16,
+        };
+
+        let limit = self.num_line_pointers() + 1;
+        let offset = target.unwrap_or(limit);
+
+        if offset > limit {
+            // reject putting items beyond the first unused slot
+            // the insert should be in order even if we are redoing the log records
+            return Err(Error::InvalidArgument(
+                "target offset is too large".to_owned(),
+            ));
+        }
+
+        let need_shuffle = !overwrite && offset < limit;
+        if need_shuffle {
+            let src = &mut self.get_item_page_payload_mut()
+                [P_POINTERS + (offset - 1) * LINE_POINTER_SIZE..];
+
+            unsafe {
+                std::ptr::copy(
+                    src.as_ptr(),
+                    src.as_mut_ptr().add(LINE_POINTER_SIZE),
+                    (limit - offset) * LINE_POINTER_SIZE,
+                );
+            }
+        }
+
+        self.put_line_pointer(offset, lp);
+        if offset == limit || need_shuffle {
+            lower += LINE_POINTER_SIZE as u16;
+        }
+
+        (&mut self.get_item_page_payload_mut()[upper as usize..upper as usize + item.len()])
+            .copy_from_slice(item);
+
+        self.set_lower(lower);
+        self.set_upper(upper);
+
+        Ok(offset)
+    }
+
+    fn set_item(&mut self, offset: usize, item: &[u8]) -> Result<()> {
+        let LinePointer { off, len } = self.get_line_pointer(offset);
+
+        if len as usize != item.len() {
+            return Err(Error::InvalidArgument(
+                "tuple size does not match".to_owned(),
+            ));
+        }
+        (&mut self.get_item_page_payload_mut()[off as usize..off as usize + len as usize])
+            .copy_from_slice(item);
+
+        Ok(())
     }
 }
