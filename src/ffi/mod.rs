@@ -2,7 +2,7 @@ extern crate env_logger;
 extern crate libc;
 
 use crate::{
-    am::index::{IndexKeyComparator, IndexPtr},
+    am::index::{IndexKeyComparator, IndexPtr, IndexScanIterator, IndexScanPredicate},
     catalog::Schema,
     concurrency::{IsolationLevel, Transaction},
     storage::{ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
@@ -206,7 +206,7 @@ pub extern "C" fn sq_free_table(table: *const TablePtr) {
 }
 
 #[no_mangle]
-pub extern "C" fn sq_table_insert_tuple<'a>(
+pub extern "C" fn sq_table_insert_tuple(
     table: *const TablePtr,
     db: *const DB,
     txn: *const Transaction,
@@ -457,8 +457,8 @@ pub extern "C" fn sq_free_index(index: *const IndexPtr) {
 
 #[no_mangle]
 pub extern "C" fn sq_index_insert(
-    db: *const DB,
     index: *const IndexPtr,
+    db: *const DB,
     key: *const u8,
     length: c_int,
     key_comparator_func: *const (),
@@ -504,4 +504,141 @@ pub extern "C" fn sq_index_insert(
             update_last_error(e);
         }
     };
+}
+
+#[no_mangle]
+pub extern "C" fn sq_index_begin_scan<'a>(
+    index: *const IndexPtr,
+    db: *const DB,
+    txn: *mut Transaction,
+    table: *const TablePtr,
+    key_comparator_func: *const (),
+) -> *mut Box<dyn IndexScanIterator<'a> + 'a> {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let index: &IndexPtr = unsafe {
+        assert!(!index.is_null());
+        &*index
+    };
+    let txn: &mut Transaction = unsafe {
+        assert!(!txn.is_null());
+        &mut *txn
+    };
+    let table: &TablePtr = unsafe {
+        assert!(!table.is_null());
+        &*table
+    };
+
+    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
+        unsafe { std::mem::transmute(key_comparator_func) };
+
+    let key_comparator = IndexKeyComparator::new(move |a: &[u8], b: &[u8]| {
+        let result =
+            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
+
+        match result {
+            -1 => Ok(std::cmp::Ordering::Less),
+            0 => Ok(std::cmp::Ordering::Equal),
+            1 => Ok(std::cmp::Ordering::Greater),
+            _ => Err(Error::InvalidArgument(
+                "cannot compare index keys".to_owned(),
+            )),
+        }
+    });
+
+    let iterator = match index.begin_scan(db, txn, &**table, key_comparator) {
+        Ok(iterator) => iterator,
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    Box::into_raw(Box::new(iterator))
+}
+
+#[no_mangle]
+pub extern "C" fn sq_free_index_scan_iterator<'a>(
+    iterator: *mut Box<dyn IndexScanIterator<'a> + 'a>,
+) {
+    if iterator.is_null() {
+        return;
+    }
+    unsafe {
+        Box::from_raw(iterator);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_index_rescan<'a>(
+    iterator: *mut Box<dyn IndexScanIterator<'a> + 'a>,
+    db: *const DB,
+    start_key: *const u8,
+    length: c_int,
+    predicate_func: *const (),
+) {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+
+    let iterator: &mut Box<dyn IndexScanIterator<'a> + 'a> = unsafe {
+        assert!(!iterator.is_null());
+        &mut *iterator
+    };
+
+    let start_key = unsafe { std::slice::from_raw_parts(start_key, length as usize) };
+
+    let predicate_func: extern "C" fn(*const u8, c_uint) -> c_int =
+        unsafe { std::mem::transmute(predicate_func) };
+
+    let predicate = IndexScanPredicate::new(move |a: &[u8]| {
+        let result = predicate_func(a.as_ptr(), a.len() as c_uint);
+
+        match result {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::InvalidArgument(
+                "cannot match keys with predicates".to_owned(),
+            )),
+        }
+    });
+
+    match iterator.rescan(db, start_key, predicate) {
+        Ok(_) => {}
+        Err(e) => {
+            update_last_error(e);
+        }
+    };
+}
+
+#[no_mangle]
+pub extern "C" fn sq_index_scan_next<'a>(
+    iterator: *mut Box<dyn IndexScanIterator<'a> + 'a>,
+    db: *const DB,
+    dir: c_int,
+) -> *const Box<dyn Tuple + 'a> {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let iterator: &mut Box<dyn IndexScanIterator<'a> + 'a> = unsafe {
+        assert!(!iterator.is_null());
+        &mut *iterator
+    };
+
+    let tuple = match iterator.next(db, get_scan_direction(dir)) {
+        Ok(Some(tuple)) => tuple.materialize(),
+        Ok(None) => {
+            return std::ptr::null();
+        }
+        Err(e) => {
+            update_last_error(e);
+            return std::ptr::null();
+        }
+    };
+
+    Box::into_raw(Box::new(tuple))
 }

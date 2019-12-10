@@ -36,7 +36,7 @@ pub trait Index: Relation + Sync + Send {
         db: &DB,
         txn: &'a mut Transaction,
         table: &'a dyn Table,
-        key_comparator: &'a IndexKeyComparator<'a>,
+        key_comparator: IndexKeyComparator<'a>,
     ) -> Result<Box<dyn IndexScanIterator<'a> + 'a>>;
 }
 

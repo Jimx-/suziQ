@@ -1,3 +1,4 @@
+mod btree_log;
 mod btree_page;
 
 use crate::{
@@ -8,11 +9,13 @@ use crate::{
     concurrency::{Snapshot, Transaction, XID},
     storage::{
         consts::PAGE_SIZE, DiskPageReader, DiskPageWriter, ForkType, ItemPageReader,
-        ItemPageWriter, ItemPointer, PageReadGuard, PageWriteGuard, PinnedPagePtr,
+        ItemPageWriter, ItemPointer, PageReadGuard, PageWriteGuard, PinnedPagePtr, RelFileRef,
         RelationWithStorage, ScanDirection, StorageHandle, Table, TuplePtr,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
+
+pub(crate) use self::btree_log::BTreeLogRecord;
 
 use self::btree_page::{views::*, BTreePageFlags, BTreePageType};
 
@@ -598,6 +601,7 @@ impl BTree {
         path: TreePath,
     ) -> Result<()> {
         let mut page_lock = page;
+        let (_, _, page_num) = page_lock.get_fork_and_num();
         let mut page_view = BTreeDataPageViewMut::new(page_lock.buffer_mut());
 
         if page_view.get_free_space() < tuple.len() {
@@ -611,7 +615,20 @@ impl BTree {
         } else {
             page_view.put_item(tuple, Some(offset), false)?;
 
+            let insert_log = BTreeLogRecord::create_btree_insert_log(
+                RelFileRef {
+                    db: self.rel_db(),
+                    rel_id: self.rel_id(),
+                },
+                ForkType::Main,
+                page_num,
+                offset,
+                tuple,
+            );
+            let (_, lsn) = db.get_wal().append(XID::default(), insert_log)?;
+            page_view.set_lsn(lsn);
             page_lock.set_dirty(true);
+
             db.get_buffer_manager()
                 .release_page(*OwningPageWriteLock::into_head(page_lock))
         }
@@ -744,10 +761,9 @@ impl BTree {
         db: &DB,
         iterator: &mut BTreeScanIterator<'a>,
         dir: ScanDirection,
-        key_comparator: &IndexKeyComparator,
     ) -> Result<Option<ItemPointer>> {
         // TODO: we treat the key as boundary key, but if it is not, we should start from the first (last) page
-        match self.search_read(db, &iterator.start_key[..], key_comparator)? {
+        match self.search_read(db, &iterator.start_key[..], &iterator.key_comparator)? {
             None => Ok(None),
             Some((page_lock, _)) => {
                 let (_, _, page_num) = page_lock.get_fork_and_num();
@@ -755,7 +771,7 @@ impl BTree {
                 let offset = self.binary_search_page(
                     &page_view,
                     &iterator.start_key[..],
-                    key_comparator,
+                    &iterator.key_comparator,
                     ItemPointer::default(),
                     false,
                 )?;
@@ -899,7 +915,7 @@ impl Index for BTree {
         db: &DB,
         txn: &'a mut Transaction,
         table: &'a dyn Table,
-        key_comparator: &'a IndexKeyComparator<'a>,
+        key_comparator: IndexKeyComparator<'a>,
     ) -> Result<Box<dyn IndexScanIterator<'a> + 'a>> {
         let xid = txn.xid();
         let snapshot = db.get_transaction_manager().get_snapshot(txn)?;
@@ -927,7 +943,7 @@ pub struct BTreeScanIterator<'a> {
     xid: XID,
     snapshot: &'a Snapshot,
     table: &'a dyn Table,
-    key_comparator: &'a IndexKeyComparator<'a>,
+    key_comparator: IndexKeyComparator<'a>,
     predicate: Option<IndexScanPredicate<'a>>,
     cur_page: Option<PinnedPagePtr>,
     cur_page_num: Option<usize>,
@@ -1030,7 +1046,7 @@ impl<'a> BTreeScanIterator<'a> {
         if self.is_valid() {
             self.scan_next(db, dir)
         } else {
-            self.btree.scan_first(db, self, dir, self.key_comparator)
+            self.btree.scan_first(db, self, dir)
         }
     }
 
@@ -1139,7 +1155,7 @@ mod tests {
 
         {
             let mut iter = btree
-                .begin_scan(&db, &mut txn, &*heap, &key_comparator)
+                .begin_scan(&db, &mut txn, &*heap, key_comparator)
                 .unwrap();
             iter.rescan(&db, &make_key(50), predicate).unwrap();
 

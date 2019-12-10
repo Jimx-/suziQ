@@ -1,5 +1,5 @@
 use crate::{
-    am::heap::HeapLogRecord,
+    am::{btree::BTreeLogRecord, heap::HeapLogRecord},
     concurrency::{TransactionLogRecord, XID},
     wal::{LogPointer, WalLogRecord},
     Result, DB,
@@ -13,6 +13,7 @@ pub enum LogRecord<'a> {
     Heap(HeapLogRecord<'a>),
     Transaction(TransactionLogRecord),
     Wal(WalLogRecord),
+    BTree(BTreeLogRecord<'a>),
 }
 
 impl<'a> LogRecord<'a> {
@@ -21,6 +22,7 @@ impl<'a> LogRecord<'a> {
             LogRecord::Heap(heap_log) => heap_log.apply(db, xid, lsn),
             LogRecord::Transaction(txn_log) => txn_log.apply(db, xid, lsn),
             LogRecord::Wal(wal_log) => wal_log.apply(db, xid, lsn),
+            LogRecord::BTree(btree_log) => btree_log.apply(db, xid, lsn),
         }
     }
     pub fn create_heap_record(heap_log_record: HeapLogRecord) -> LogRecord {
@@ -33,5 +35,9 @@ impl<'a> LogRecord<'a> {
 
     pub fn create_wal_record(wal_log_record: WalLogRecord) -> LogRecord<'a> {
         LogRecord::Wal(wal_log_record)
+    }
+
+    pub fn create_btree_record(btree_log_record: BTreeLogRecord) -> LogRecord {
+        LogRecord::BTree(btree_log_record)
     }
 }
