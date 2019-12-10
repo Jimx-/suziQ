@@ -280,7 +280,7 @@ impl BTree {
         db: &DB,
         key: &[u8],
         key_comparator: &IndexKeyComparator,
-    ) -> Result<Option<(OwningPageReadLock, TreePath)>> {
+    ) -> Result<(OwningPageReadLock, TreePath)> {
         let mut page_lock = self.get_root_page_read(db)?;
         let mut path = Vec::new();
 
@@ -320,7 +320,50 @@ impl BTree {
             page_lock = child_page_lock;
         }
 
-        Ok(Some((page_lock, path)))
+        Ok((page_lock, path))
+    }
+
+    /// Find the first or last leaf page in the tree and return the page with read lock.
+    fn get_endpoint(&self, db: &DB, rightmost: bool) -> Result<OwningPageReadLock> {
+        let mut page_lock = self.get_root_page_read(db)?;
+        let mut path = Vec::new();
+
+        loop {
+            let (_, _, parent_page_num) = page_lock.get_fork_and_num();
+            let page_view = BTreeDataPageView::new(page_lock.buffer());
+
+            if page_view.page_type() == BTreePageType::Leaf {
+                break;
+            }
+
+            let child_offset = if rightmost {
+                page_view.num_line_pointers()
+            } else {
+                page_view.first_key_offset()
+            };
+
+            let child_tuple_buf = page_view.get_item(child_offset);
+            let child_tuple = match bincode::deserialize::<IndexTuple>(child_tuple_buf) {
+                Ok(itup) => itup,
+                _ => {
+                    return Err(Error::DataCorrupted(
+                        "cannot deserialize index tuple".to_owned(),
+                    ))
+                }
+            };
+            let child_page_num = child_tuple.get_downlink();
+            let child_page_lock = self.get_tree_page_read(db, Some(child_page_num))?;
+
+            // release the lock on current page after acquiring the lock on the child page
+            db.get_buffer_manager()
+                .release_page(*OwningPageReadLock::into_head(page_lock))?;
+
+            path.push(ItemPointer::new(parent_page_num, child_offset));
+
+            page_lock = child_page_lock;
+        }
+
+        Ok(page_lock)
     }
 
     /// Search for the first leaf page containing the key and return the page with write lock.
@@ -756,21 +799,52 @@ impl BTree {
         }
     }
 
+    fn scan_endpoint<'a>(
+        &self,
+        db: &DB,
+        iterator: &mut BTreeScanIterator<'a>,
+        dir: ScanDirection,
+    ) -> Result<Option<ItemPointer>> {
+        let page_lock = self.get_endpoint(db, dir == ScanDirection::Backward)?;
+        let (_, _, page_num) = page_lock.get_fork_and_num();
+        let page_view = BTreeDataPageView::new(page_lock.buffer());
+        let offset = match dir {
+            ScanDirection::Forward => page_view.first_key_offset(),
+            ScanDirection::Backward => page_view.num_line_pointers(),
+        };
+
+        iterator.read_page(&page_view, dir, offset)?;
+
+        db.get_buffer_manager()
+            .release_page(*OwningPageReadLock::into_head(page_lock))?;
+
+        if iterator.items.is_empty() {
+            // no items
+            iterator.invalidate();
+            self.step_page(db, iterator, dir)
+        } else {
+            iterator.cur_page_num = Some(page_num);
+            let item_ptr = iterator.current_item_pointer();
+            Ok(item_ptr)
+        }
+    }
+
     fn scan_first<'a>(
         &'a self,
         db: &DB,
         iterator: &mut BTreeScanIterator<'a>,
         dir: ScanDirection,
     ) -> Result<Option<ItemPointer>> {
-        // TODO: we treat the key as boundary key, but if it is not, we should start from the first (last) page
-        match self.search_read(db, &iterator.start_key[..], &iterator.key_comparator)? {
-            None => Ok(None),
-            Some((page_lock, _)) => {
+        let start_key = iterator.start_key.take();
+
+        match start_key {
+            Some(start_key) => {
+                let (page_lock, _) = self.search_read(db, &start_key, &iterator.key_comparator)?;
                 let (_, _, page_num) = page_lock.get_fork_and_num();
                 let page_view = BTreeDataPageView::new(page_lock.buffer());
                 let offset = self.binary_search_page(
                     &page_view,
-                    &iterator.start_key[..],
+                    &start_key,
                     &iterator.key_comparator,
                     ItemPointer::default(),
                     false,
@@ -784,13 +858,14 @@ impl BTree {
                 if iterator.items.is_empty() {
                     // no items
                     iterator.invalidate();
-                    Ok(None)
+                    self.step_page(db, iterator, dir)
                 } else {
                     iterator.cur_page_num = Some(page_num);
                     let item_ptr = iterator.current_item_pointer();
                     Ok(item_ptr)
                 }
             }
+            _ => self.scan_endpoint(db, iterator, dir),
         }
     }
 
@@ -830,7 +905,7 @@ impl BTree {
         if iterator.items.is_empty() {
             // no items
             iterator.invalidate();
-            Ok(None)
+            self.step_page(db, iterator, dir)
         } else {
             iterator.cur_page_num = Some(page_num);
             let item_ptr = iterator.current_item_pointer();
@@ -929,7 +1004,7 @@ impl Index for BTree {
             cur_page: None,
             cur_page_num: None,
             next_page: 0,
-            start_key: Vec::new(),
+            start_key: None,
             items: Vec::new(),
             item_index: 0,
         };
@@ -947,10 +1022,10 @@ pub struct BTreeScanIterator<'a> {
     predicate: Option<IndexScanPredicate<'a>>,
     cur_page: Option<PinnedPagePtr>,
     cur_page_num: Option<usize>,
+    start_key: Option<Vec<u8>>,
+    next_page: usize,
 
     // these members are valid when cur_page_num is not None
-    next_page: usize,
-    start_key: Vec<u8>,
     items: Vec<IndexTuple<'a>>,
     item_index: usize,
 }
@@ -1064,7 +1139,7 @@ impl<'a> IndexScanIterator<'a> for BTreeScanIterator<'a> {
     fn rescan(
         &mut self,
         db: &'a DB,
-        start_key: &[u8],
+        start_key: Option<&[u8]>,
         predicate: IndexScanPredicate<'a>,
     ) -> Result<()> {
         let cur_page = self.cur_page.take();
@@ -1072,7 +1147,7 @@ impl<'a> IndexScanIterator<'a> for BTreeScanIterator<'a> {
             db.get_buffer_manager().release_page(page_ptr)?;
         }
 
-        self.start_key = start_key.to_vec();
+        self.start_key = start_key.map(|key| key.to_vec());
         self.predicate = Some(predicate);
         Ok(())
     }
@@ -1157,7 +1232,7 @@ mod tests {
             let mut iter = btree
                 .begin_scan(&db, &mut txn, &*heap, key_comparator)
                 .unwrap();
-            iter.rescan(&db, &make_key(50), predicate).unwrap();
+            iter.rescan(&db, None, predicate).unwrap();
 
             let mut count = 0;
             while let Some(tuple) = iter.next(&db, ScanDirection::Forward).unwrap() {

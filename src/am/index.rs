@@ -10,7 +10,7 @@ pub trait IndexScanIterator<'a> {
     fn rescan(
         &mut self,
         db: &'a DB,
-        start_key: &[u8],
+        start_key: Option<&[u8]>,
         predicate: IndexScanPredicate<'a>,
     ) -> Result<()>;
     fn next(&mut self, db: &'a DB, dir: ScanDirection) -> Result<Option<TuplePtr<'a>>>;

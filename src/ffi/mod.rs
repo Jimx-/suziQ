@@ -589,7 +589,13 @@ pub extern "C" fn sq_index_rescan<'a>(
         &mut *iterator
     };
 
-    let start_key = unsafe { std::slice::from_raw_parts(start_key, length as usize) };
+    let start_key = unsafe {
+        if start_key.is_null() {
+            None
+        } else {
+            Some(std::slice::from_raw_parts(start_key, length as usize))
+        }
+    };
 
     let predicate_func: extern "C" fn(*const u8, c_uint) -> c_int =
         unsafe { std::mem::transmute(predicate_func) };
