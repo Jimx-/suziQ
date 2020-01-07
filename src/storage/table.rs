@@ -1,21 +1,10 @@
 use crate::{
-    catalog::Schema,
     concurrency::{Snapshot, Transaction, XID},
     storage::ItemPointer,
     Relation, Result, DB,
 };
 
 use std::sync::Arc;
-
-pub struct TableData {
-    schema: Schema,
-}
-
-impl TableData {
-    pub fn new(schema: Schema) -> Self {
-        Self { schema }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanDirection {
@@ -37,12 +26,6 @@ pub trait TableScanIterator<'a> {
 }
 
 pub trait Table: Relation + Sync + Send {
-    fn get_table_data(&self) -> &TableData;
-
-    fn table_schema(&self) -> &Schema {
-        &self.get_table_data().schema
-    }
-
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer>;
 
     fn begin_scan<'a>(

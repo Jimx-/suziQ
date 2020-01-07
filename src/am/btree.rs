@@ -1160,8 +1160,8 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        am::index::IndexScanPredicate, catalog::Schema, concurrency::IsolationLevel,
-        storage::ScanDirection, test_util::get_temp_db,
+        am::index::IndexScanPredicate, concurrency::IsolationLevel, storage::ScanDirection,
+        test_util::get_temp_db,
     };
 
     use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -1187,7 +1187,7 @@ mod tests {
     fn can_insert_and_scan_btree() {
         let (db, db_dir) = get_temp_db();
         let mut txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
-        let heap = db.create_table(0, 0, Schema::new()).unwrap();
+        let heap = db.create_table(0, 0).unwrap();
         let btree = db
             .create_index(0, 1, |a: &[u8], b: &[u8]| {
                 let a = LittleEndian::read_u32(a);

@@ -3,7 +3,6 @@ extern crate libc;
 
 use crate::{
     am::index::{IndexPtr, IndexScanIterator, IndexScanPredicate},
-    catalog::Schema,
     concurrency::{IsolationLevel, Transaction},
     storage::{ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
     DBConfig, Error, Result, DB, OID,
@@ -163,7 +162,7 @@ pub extern "C" fn sq_create_table(db: *const DB, db_oid: OID, rel_oid: OID) -> *
         &*db
     };
 
-    let table = match db.create_table(db_oid, rel_oid, Schema::new()) {
+    let table = match db.create_table(db_oid, rel_oid) {
         Ok(table) => table,
         Err(e) => {
             update_last_error(e);

@@ -7,7 +7,6 @@ use std::{
 
 use crate::{
     am::{btree::BTree, heap::Heap, Index, IndexPtr},
-    catalog::{CatalogCache, Schema},
     concurrency::{IsolationLevel, StateManager, Transaction, TransactionManager},
     storage::{BufferManager, ForkType, RelationWithStorage, StorageManager, TablePtr},
     wal::{CheckpointManager, DBState, Wal},
@@ -17,7 +16,6 @@ use crate::{
 pub struct DB {
     bufmgr: BufferManager,
     smgr: StorageManager,
-    catalog_cache: Mutex<CatalogCache>,
     txnmgr: TransactionManager,
     wal: Wal,
     ckptmgr: Mutex<CheckpointManager>,
@@ -28,7 +26,6 @@ impl DB {
     pub fn open(config: &DBConfig) -> Result<Self> {
         let smgr = StorageManager::new(config.get_storage_path());
         let bufmgr = BufferManager::new(config.cache_capacity);
-        let catalog_cache = CatalogCache::new();
         let txnmgr = TransactionManager::open(config.get_transaction_path())?;
         let wal = Wal::open(config.get_wal_path(), &config.wal_config)?;
         let ckptmgr = CheckpointManager::open(config.get_master_record_path())?;
@@ -36,7 +33,6 @@ impl DB {
         let db = Self {
             bufmgr,
             smgr,
-            catalog_cache: Mutex::new(catalog_cache),
             txnmgr,
             wal,
             ckptmgr: Mutex::new(ckptmgr),
@@ -104,27 +100,18 @@ impl DB {
         Ok(())
     }
 
-    pub fn create_table(&self, db: OID, rel_id: OID, schema: Schema) -> Result<TablePtr> {
-        let mut guard = self.catalog_cache.lock().unwrap();
-        let heap = Arc::new(Heap::new(rel_id, db, schema));
+    pub fn create_table(&self, db: OID, rel_id: OID) -> Result<TablePtr> {
+        let heap = Arc::new(Heap::new(rel_id, db));
         heap.create_storage(&self.smgr)?;
-        guard.add_table(heap.clone());
         Ok(heap)
     }
 
     pub fn open_table(&self, db: OID, rel_id: OID) -> Result<Option<TablePtr>> {
-        let mut guard = self.catalog_cache.lock().unwrap();
-        match guard.lookup_table(rel_id) {
-            Some(table) => Ok(Some(table)),
-            None => {
-                if self.smgr.exists(db, rel_id, ForkType::Main)? {
-                    let heap = Arc::new(Heap::new(rel_id, db, Schema::new()));
-                    guard.add_table(heap.clone());
-                    Ok(Some(heap))
-                } else {
-                    Ok(None)
-                }
-            }
+        if self.smgr.exists(db, rel_id, ForkType::Main)? {
+            let heap = Arc::new(Heap::new(rel_id, db));
+            Ok(Some(heap))
+        } else {
+            Ok(None)
         }
     }
 
@@ -132,11 +119,9 @@ impl DB {
     where
         F: Fn(&[u8], &[u8]) -> Result<std::cmp::Ordering> + Sync + Send + 'static,
     {
-        let mut guard = self.catalog_cache.lock().unwrap();
         let btree = Arc::new(BTree::new(rel_id, db, key_comparator));
         btree.create_storage(&self.smgr)?;
         btree.build_empty(self)?;
-        guard.add_index(btree.clone());
         Ok(btree)
     }
 
@@ -144,18 +129,11 @@ impl DB {
     where
         F: Fn(&[u8], &[u8]) -> Result<std::cmp::Ordering> + Sync + Send + 'static,
     {
-        let mut guard = self.catalog_cache.lock().unwrap();
-        match guard.lookup_index(rel_id) {
-            Some(index) => Ok(Some(index)),
-            None => {
-                if self.smgr.exists(db, rel_id, ForkType::Main)? {
-                    let index = Arc::new(BTree::new(rel_id, db, key_comparator));
-                    guard.add_index(index.clone());
-                    Ok(Some(index))
-                } else {
-                    Ok(None)
-                }
-            }
+        if self.smgr.exists(db, rel_id, ForkType::Main)? {
+            let index = Arc::new(BTree::new(rel_id, db, key_comparator));
+            Ok(Some(index))
+        } else {
+            Ok(None)
         }
     }
 

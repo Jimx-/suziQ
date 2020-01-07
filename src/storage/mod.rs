@@ -18,7 +18,7 @@ use self::consts::PAGE_SIZE;
 pub use self::{
     buffer_manager::BufferManager,
     storage_manager::{ForkType, StorageHandle, StorageManager},
-    table::{ScanDirection, Table, TableData, TablePtr, TableScanIterator, Tuple, TuplePtr},
+    table::{ScanDirection, Table, TablePtr, TableScanIterator, Tuple, TuplePtr},
 };
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};

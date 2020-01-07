@@ -2,12 +2,11 @@ mod heap_log;
 mod heap_page;
 
 use crate::{
-    catalog::Schema,
     concurrency::{Snapshot, Transaction, TransactionStatus, XID},
     storage::{
         consts::PAGE_SIZE, BufferManager, DiskPageWriter, ForkType, ItemPageReader, ItemPageWriter,
         ItemPointer, PinnedPagePtr, RelFileRef, RelationWithStorage, ScanDirection, StorageHandle,
-        Table, TableData, TableScanIterator, Tuple, TuplePtr,
+        Table, TableScanIterator, Tuple, TuplePtr,
     },
     Error, Relation, RelationEntry, RelationKind, Result, DB, OID,
 };
@@ -198,19 +197,16 @@ impl<'a> Drop for BufferHeapTuple<'a> {
 
 pub struct Heap {
     rel_entry: RelationEntry,
-    table_data: TableData,
     shandle: Mutex<Option<StorageHandle>>,
     insert_hint: Mutex<Option<usize>>,
 }
 
 impl Heap {
-    pub fn new(rel_id: OID, db: OID, schema: Schema) -> Self {
+    pub fn new(rel_id: OID, db: OID) -> Self {
         let rel_entry = RelationEntry::new(rel_id, db, RelationKind::Table);
-        let table_data = TableData::new(schema);
 
         Self {
             rel_entry,
-            table_data,
             shandle: Mutex::new(None),
             insert_hint: Mutex::new(None),
         }
@@ -626,10 +622,6 @@ impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
 }
 
 impl Table for Heap {
-    fn get_table_data(&self) -> &TableData {
-        &self.table_data
-    }
-
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer> {
         let htup = self.prepare_heap_tuple_for_insert(txn.xid(), tuple);
         let htup_buf = bincode::serialize(&htup).unwrap();
@@ -772,17 +764,14 @@ impl RelationWithStorage for Heap {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        catalog::Schema, concurrency::IsolationLevel, storage::ScanDirection,
-        test_util::get_temp_db,
-    };
+    use crate::{concurrency::IsolationLevel, storage::ScanDirection, test_util::get_temp_db};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[test]
     fn can_create_heap() {
         let (db, db_dir) = get_temp_db();
-        assert!(db.create_table(0, 0, Schema::new()).is_ok());
+        assert!(db.create_table(0, 0).is_ok());
 
         let mut rel_path = db_dir.path().to_path_buf();
         rel_path.push("base");
@@ -797,7 +786,7 @@ mod tests {
     fn can_insert_and_scan_heap() {
         let (db, db_dir) = get_temp_db();
         let mut txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
-        let heap = db.create_table(0, 0, Schema::new()).unwrap();
+        let heap = db.create_table(0, 0).unwrap();
 
         let data: &[u8] = &[1u8; 100];
         for _ in 0..100 {
@@ -831,7 +820,7 @@ mod tests {
     fn can_handle_read_committed() {
         let (db, db_dir) = get_temp_db();
         let db = Arc::new(db);
-        db.create_table(0, 0, Schema::new()).unwrap();
+        db.create_table(0, 0).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
 
@@ -904,7 +893,7 @@ mod tests {
     fn can_handle_repeatable_read() {
         let (db, db_dir) = get_temp_db();
         let db = Arc::new(db);
-        db.create_table(0, 0, Schema::new()).unwrap();
+        db.create_table(0, 0).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
 
