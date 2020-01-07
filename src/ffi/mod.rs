@@ -2,7 +2,7 @@ extern crate env_logger;
 extern crate libc;
 
 use crate::{
-    am::index::{IndexKeyComparator, IndexPtr, IndexScanIterator, IndexScanPredicate},
+    am::index::{IndexPtr, IndexScanIterator, IndexScanPredicate},
     catalog::Schema,
     concurrency::{IsolationLevel, Transaction},
     storage::{ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
@@ -407,13 +407,35 @@ pub extern "C" fn sq_get_next_oid(db: *const DB) -> OID {
 }
 
 #[no_mangle]
-pub extern "C" fn sq_create_index(db: *const DB, db_oid: OID, rel_oid: OID) -> *const IndexPtr {
+pub extern "C" fn sq_create_index(
+    db: *const DB,
+    db_oid: OID,
+    rel_oid: OID,
+    key_comparator_func: *const (),
+) -> *const IndexPtr {
     let db = unsafe {
         assert!(!db.is_null());
         &*db
     };
 
-    let index = match db.create_index(db_oid, rel_oid) {
+    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
+        unsafe { std::mem::transmute(key_comparator_func) };
+
+    let key_comparator = move |a: &[u8], b: &[u8]| {
+        let result =
+            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
+
+        match result {
+            -1 => Ok(std::cmp::Ordering::Less),
+            0 => Ok(std::cmp::Ordering::Equal),
+            1 => Ok(std::cmp::Ordering::Greater),
+            _ => Err(Error::InvalidArgument(
+                "cannot compare index keys".to_owned(),
+            )),
+        }
+    };
+
+    let index = match db.create_index(db_oid, rel_oid, key_comparator) {
         Ok(index) => index,
         Err(e) => {
             update_last_error(e);
@@ -425,13 +447,35 @@ pub extern "C" fn sq_create_index(db: *const DB, db_oid: OID, rel_oid: OID) -> *
 }
 
 #[no_mangle]
-pub extern "C" fn sq_open_index(db: *const DB, db_oid: OID, rel_oid: OID) -> *const IndexPtr {
+pub extern "C" fn sq_open_index(
+    db: *const DB,
+    db_oid: OID,
+    rel_oid: OID,
+    key_comparator_func: *const (),
+) -> *const IndexPtr {
     let db = unsafe {
         assert!(!db.is_null());
         &*db
     };
 
-    let index = match db.open_index(db_oid, rel_oid) {
+    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
+        unsafe { std::mem::transmute(key_comparator_func) };
+
+    let key_comparator = move |a: &[u8], b: &[u8]| {
+        let result =
+            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
+
+        match result {
+            -1 => Ok(std::cmp::Ordering::Less),
+            0 => Ok(std::cmp::Ordering::Equal),
+            1 => Ok(std::cmp::Ordering::Greater),
+            _ => Err(Error::InvalidArgument(
+                "cannot compare index keys".to_owned(),
+            )),
+        }
+    };
+
+    let index = match db.open_index(db_oid, rel_oid, key_comparator) {
         Ok(Some(index)) => index,
         Ok(None) => {
             return std::ptr::null();
@@ -461,7 +505,6 @@ pub extern "C" fn sq_index_insert(
     db: *const DB,
     key: *const u8,
     length: c_int,
-    key_comparator_func: *const (),
     item_pointer: *const ItemPointer,
 ) {
     let db = unsafe {
@@ -481,24 +524,7 @@ pub extern "C" fn sq_index_insert(
 
     let key = unsafe { std::slice::from_raw_parts(key, length as usize) };
 
-    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
-        unsafe { std::mem::transmute(key_comparator_func) };
-
-    let key_comparator = IndexKeyComparator::new(|a: &[u8], b: &[u8]| {
-        let result =
-            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
-
-        match result {
-            -1 => Ok(std::cmp::Ordering::Less),
-            0 => Ok(std::cmp::Ordering::Equal),
-            1 => Ok(std::cmp::Ordering::Greater),
-            _ => Err(Error::InvalidArgument(
-                "cannot compare index keys".to_owned(),
-            )),
-        }
-    });
-
-    match index.insert(db, key, &key_comparator, item_pointer) {
+    match index.insert(db, key, item_pointer) {
         Ok(_) => {}
         Err(e) => {
             update_last_error(e);
@@ -512,7 +538,6 @@ pub extern "C" fn sq_index_begin_scan<'a>(
     db: *const DB,
     txn: *mut Transaction,
     table: *const TablePtr,
-    key_comparator_func: *const (),
 ) -> *mut Box<dyn IndexScanIterator<'a> + 'a> {
     let db = unsafe {
         assert!(!db.is_null());
@@ -531,24 +556,7 @@ pub extern "C" fn sq_index_begin_scan<'a>(
         &*table
     };
 
-    let key_comparator_func: extern "C" fn(*const u8, c_uint, *const u8, c_uint) -> c_int =
-        unsafe { std::mem::transmute(key_comparator_func) };
-
-    let key_comparator = IndexKeyComparator::new(move |a: &[u8], b: &[u8]| {
-        let result =
-            key_comparator_func(a.as_ptr(), a.len() as c_uint, b.as_ptr(), b.len() as c_uint);
-
-        match result {
-            -1 => Ok(std::cmp::Ordering::Less),
-            0 => Ok(std::cmp::Ordering::Equal),
-            1 => Ok(std::cmp::Ordering::Greater),
-            _ => Err(Error::InvalidArgument(
-                "cannot compare index keys".to_owned(),
-            )),
-        }
-    });
-
-    let iterator = match index.begin_scan(db, txn, &**table, key_comparator) {
+    let iterator = match index.begin_scan(db, txn, &**table) {
         Ok(iterator) => iterator,
         Err(e) => {
             update_last_error(e);

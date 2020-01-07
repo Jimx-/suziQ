@@ -128,22 +128,28 @@ impl DB {
         }
     }
 
-    pub fn create_index(&self, db: OID, rel_id: OID) -> Result<IndexPtr> {
+    pub fn create_index<F>(&self, db: OID, rel_id: OID, key_comparator: F) -> Result<IndexPtr>
+    where
+        F: Fn(&[u8], &[u8]) -> Result<std::cmp::Ordering> + Sync + Send + 'static,
+    {
         let mut guard = self.catalog_cache.lock().unwrap();
-        let btree = Arc::new(BTree::new(rel_id, db));
+        let btree = Arc::new(BTree::new(rel_id, db, key_comparator));
         btree.create_storage(&self.smgr)?;
         btree.build_empty(self)?;
         guard.add_index(btree.clone());
         Ok(btree)
     }
 
-    pub fn open_index(&self, db: OID, rel_id: OID) -> Result<Option<IndexPtr>> {
+    pub fn open_index<F>(&self, db: OID, rel_id: OID, key_comparator: F) -> Result<Option<IndexPtr>>
+    where
+        F: Fn(&[u8], &[u8]) -> Result<std::cmp::Ordering> + Sync + Send + 'static,
+    {
         let mut guard = self.catalog_cache.lock().unwrap();
         match guard.lookup_index(rel_id) {
             Some(index) => Ok(Some(index)),
             None => {
                 if self.smgr.exists(db, rel_id, ForkType::Main)? {
-                    let index = Arc::new(BTree::new(rel_id, db));
+                    let index = Arc::new(BTree::new(rel_id, db, key_comparator));
                     guard.add_index(index.clone());
                     Ok(Some(index))
                 } else {

@@ -3,7 +3,7 @@ mod btree_page;
 
 use crate::{
     am::{
-        index::{IndexKeyComparator, IndexScanIterator, IndexScanPredicate},
+        index::{IndexScanIterator, IndexScanPredicate},
         Index,
     },
     concurrency::{Snapshot, Transaction, XID},
@@ -80,18 +80,26 @@ type TreePath = Vec<ItemPointer>;
 
 const BTREE_META_PAGE_NUM: usize = 0;
 
-pub struct BTree {
+pub struct BTree<KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     rel_entry: RelationEntry,
     shandle: Mutex<Option<StorageHandle>>,
+    key_comparator: KCmp,
 }
 
-impl BTree {
-    pub fn new(rel_id: OID, db: OID) -> Self {
+impl<KCmp> BTree<KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
+    pub fn new(rel_id: OID, db: OID, key_comparator: KCmp) -> Self {
         let rel_entry = RelationEntry::new(rel_id, db, RelationKind::Index);
 
         Self {
             rel_entry,
             shandle: Mutex::new(None),
+            key_comparator,
         }
     }
 
@@ -275,12 +283,7 @@ impl BTree {
     }
 
     /// Search for the first leaf page containing the key and return the page with read lock.
-    fn search_read(
-        &self,
-        db: &DB,
-        key: &[u8],
-        key_comparator: &IndexKeyComparator,
-    ) -> Result<(OwningPageReadLock, TreePath)> {
+    fn search_read(&self, db: &DB, key: &[u8]) -> Result<(OwningPageReadLock, TreePath)> {
         let mut page_lock = self.get_root_page_read(db)?;
         let mut path = Vec::new();
 
@@ -292,13 +295,8 @@ impl BTree {
                 break;
             }
 
-            let child_offset = self.binary_search_page(
-                &page_view,
-                key,
-                key_comparator,
-                ItemPointer::default(),
-                false,
-            )?;
+            let child_offset =
+                self.binary_search_page(&page_view, key, ItemPointer::default(), false)?;
             let child_tuple_buf = page_view.get_item(child_offset);
             let child_tuple = match bincode::deserialize::<IndexTuple>(child_tuple_buf) {
                 Ok(itup) => itup,
@@ -367,12 +365,7 @@ impl BTree {
     }
 
     /// Search for the first leaf page containing the key and return the page with write lock.
-    fn search_write(
-        &self,
-        db: &DB,
-        key: &[u8],
-        key_comparator: &IndexKeyComparator,
-    ) -> Result<(OwningPageWriteLock, TreePath)> {
+    fn search_write(&self, db: &DB, key: &[u8]) -> Result<(OwningPageWriteLock, TreePath)> {
         let mut page_lock = self.get_root_page_write(db)?;
         let mut path = Vec::new();
 
@@ -384,13 +377,8 @@ impl BTree {
                 break;
             }
 
-            let child_offset = self.binary_search_page(
-                &page_view,
-                key,
-                key_comparator,
-                ItemPointer::default(),
-                false,
-            )?;
+            let child_offset =
+                self.binary_search_page(&page_view, key, ItemPointer::default(), false)?;
             let child_tuple_buf = page_view.get_item(child_offset);
             let child_tuple = match bincode::deserialize::<IndexTuple>(child_tuple_buf) {
                 Ok(itup) => itup,
@@ -420,7 +408,6 @@ impl BTree {
         &self,
         page_view: &P,
         key: &[u8],
-        key_comparator: &IndexKeyComparator,
         item_ptr: ItemPointer,
         offset: usize,
     ) -> Result<Ordering>
@@ -444,7 +431,7 @@ impl BTree {
             }
         };
 
-        match key_comparator(key, &itup.key)? {
+        match (self.key_comparator)(key, &itup.key)? {
             Ordering::Equal => Ok(item_ptr.cmp(&itup.item_pointer)),
             ord => Ok(ord),
         }
@@ -455,7 +442,6 @@ impl BTree {
         &self,
         page_view: &P,
         key: &[u8],
-        key_comparator: &IndexKeyComparator,
         item_ptr: ItemPointer,
         next_key: bool,
     ) -> Result<usize>
@@ -479,7 +465,7 @@ impl BTree {
             while low < high {
                 let mid = low + (high - low) / 2;
 
-                if self.compare_key(page_view, key, key_comparator, item_ptr, mid)? >= cond {
+                if self.compare_key(page_view, key, item_ptr, mid)? >= cond {
                     // key > mid
                     low = mid + 1;
                 } else {
@@ -508,14 +494,13 @@ impl BTree {
         &self,
         _db: &DB,
         key: &[u8],
-        key_comparator: &IndexKeyComparator,
         item_ptr: ItemPointer,
         start_page: OwningPageWriteLock,
     ) -> Result<(OwningPageWriteLock, usize)> {
         let page_lock = start_page;
 
         let page_view = BTreeDataPageView::new(page_lock.buffer());
-        let offset = self.binary_search_page(&page_view, key, key_comparator, item_ptr, false)?;
+        let offset = self.binary_search_page(&page_view, key, item_ptr, false)?;
         Ok((page_lock, offset))
     }
 
@@ -802,7 +787,7 @@ impl BTree {
     fn scan_endpoint<'a>(
         &self,
         db: &DB,
-        iterator: &mut BTreeScanIterator<'a>,
+        iterator: &mut BTreeScanIterator<'a, KCmp>,
         dir: ScanDirection,
     ) -> Result<Option<ItemPointer>> {
         let page_lock = self.get_endpoint(db, dir == ScanDirection::Backward)?;
@@ -832,23 +817,18 @@ impl BTree {
     fn scan_first<'a>(
         &'a self,
         db: &DB,
-        iterator: &mut BTreeScanIterator<'a>,
+        iterator: &mut BTreeScanIterator<'a, KCmp>,
         dir: ScanDirection,
     ) -> Result<Option<ItemPointer>> {
         let start_key = iterator.start_key.take();
 
         match start_key {
             Some(start_key) => {
-                let (page_lock, _) = self.search_read(db, &start_key, &iterator.key_comparator)?;
+                let (page_lock, _) = self.search_read(db, &start_key)?;
                 let (_, _, page_num) = page_lock.get_fork_and_num();
                 let page_view = BTreeDataPageView::new(page_lock.buffer());
-                let offset = self.binary_search_page(
-                    &page_view,
-                    &start_key,
-                    &iterator.key_comparator,
-                    ItemPointer::default(),
-                    false,
-                )?;
+                let offset =
+                    self.binary_search_page(&page_view, &start_key, ItemPointer::default(), false)?;
 
                 iterator.read_page(&page_view, dir, offset)?;
 
@@ -872,7 +852,7 @@ impl BTree {
     fn read_next_page(
         &self,
         db: &DB,
-        iterator: &mut BTreeScanIterator,
+        iterator: &mut BTreeScanIterator<KCmp>,
         dir: ScanDirection,
         page_num: usize,
     ) -> Result<Option<ItemPointer>> {
@@ -917,7 +897,7 @@ impl BTree {
     fn step_page(
         &self,
         db: &DB,
-        iterator: &mut BTreeScanIterator,
+        iterator: &mut BTreeScanIterator<KCmp>,
         dir: ScanDirection,
     ) -> Result<Option<ItemPointer>> {
         let next_page_num = match dir {
@@ -939,19 +919,28 @@ impl BTree {
     }
 }
 
-impl Relation for BTree {
+impl<KCmp> Relation for BTree<KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     fn get_relation_entry(&self) -> &RelationEntry {
         &self.rel_entry
     }
 }
 
-impl RelationWithStorage for BTree {
+impl<KCmp> RelationWithStorage for BTree<KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     fn get_storage_handle(&self) -> &Mutex<Option<StorageHandle>> {
         &self.shandle
     }
 }
 
-impl Index for BTree {
+impl<KCmp> Index for BTree<KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     fn build_empty(&self, db: &DB) -> Result<()> {
         let smgr = db.get_storage_manager();
         self.with_storage(smgr, |storage| {
@@ -964,14 +953,8 @@ impl Index for BTree {
         })
     }
 
-    fn insert<'a>(
-        &'a self,
-        db: &DB,
-        key: &[u8],
-        key_comparator: &IndexKeyComparator,
-        item_pointer: ItemPointer,
-    ) -> Result<()> {
-        let (page_lock, path) = self.search_write(db, key, key_comparator)?;
+    fn insert<'a>(&'a self, db: &DB, key: &[u8], item_pointer: ItemPointer) -> Result<()> {
+        let (page_lock, path) = self.search_write(db, key)?;
 
         let itup = IndexTuple {
             key: key.into(),
@@ -979,8 +962,7 @@ impl Index for BTree {
         };
         let itup_buf = bincode::serialize(&itup).unwrap();
 
-        let (page_lock, offset) =
-            self.get_insert_location(db, key, key_comparator, item_pointer, page_lock)?;
+        let (page_lock, offset) = self.get_insert_location(db, key, item_pointer, page_lock)?;
 
         self.insert_into_page(db, &itup_buf[..], offset, page_lock, path)
     }
@@ -990,7 +972,6 @@ impl Index for BTree {
         db: &DB,
         txn: &'a mut Transaction,
         table: &'a dyn Table,
-        key_comparator: IndexKeyComparator<'a>,
     ) -> Result<Box<dyn IndexScanIterator<'a> + 'a>> {
         let xid = txn.xid();
         let snapshot = db.get_transaction_manager().get_snapshot(txn)?;
@@ -999,7 +980,6 @@ impl Index for BTree {
             xid,
             snapshot,
             table,
-            key_comparator,
             predicate: None,
             cur_page: None,
             cur_page_num: None,
@@ -1013,12 +993,14 @@ impl Index for BTree {
     }
 }
 
-pub struct BTreeScanIterator<'a> {
-    btree: &'a BTree,
+pub struct BTreeScanIterator<'a, KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
+    btree: &'a BTree<KCmp>,
     xid: XID,
     snapshot: &'a Snapshot,
     table: &'a dyn Table,
-    key_comparator: IndexKeyComparator<'a>,
     predicate: Option<IndexScanPredicate<'a>>,
     cur_page: Option<PinnedPagePtr>,
     cur_page_num: Option<usize>,
@@ -1030,7 +1012,10 @@ pub struct BTreeScanIterator<'a> {
     item_index: usize,
 }
 
-impl<'a> BTreeScanIterator<'a> {
+impl<'a, KCmp> BTreeScanIterator<'a, KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     fn read_page<P>(&mut self, page_view: &P, dir: ScanDirection, offset: usize) -> Result<()>
     where
         P: BTreeDataPageReader,
@@ -1135,7 +1120,10 @@ impl<'a> BTreeScanIterator<'a> {
     }
 }
 
-impl<'a> IndexScanIterator<'a> for BTreeScanIterator<'a> {
+impl<'a, KCmp> IndexScanIterator<'a> for BTreeScanIterator<'a, KCmp>
+where
+    KCmp: Fn(&[u8], &[u8]) -> Result<Ordering> + Sync + Send,
+{
     fn rescan(
         &mut self,
         db: &'a DB,
@@ -1172,11 +1160,8 @@ impl<'a> IndexScanIterator<'a> for BTreeScanIterator<'a> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        am::index::{IndexKeyComparator, IndexScanPredicate},
-        catalog::Schema,
-        concurrency::IsolationLevel,
-        storage::ScanDirection,
-        test_util::get_temp_db,
+        am::index::IndexScanPredicate, catalog::Schema, concurrency::IsolationLevel,
+        storage::ScanDirection, test_util::get_temp_db,
     };
 
     use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -1184,7 +1169,9 @@ mod tests {
     #[test]
     fn can_create_btree() {
         let (db, db_dir) = get_temp_db();
-        let btree = db.create_index(0, 0).unwrap();
+        let btree = db
+            .create_index(0, 0, |_: &[u8], _: &[u8]| Ok(std::cmp::Ordering::Equal))
+            .unwrap();
         btree.build_empty(&db).unwrap();
 
         let mut rel_path = db_dir.path().to_path_buf();
@@ -1201,7 +1188,13 @@ mod tests {
         let (db, db_dir) = get_temp_db();
         let mut txn = db.start_transaction(IsolationLevel::ReadCommitted).unwrap();
         let heap = db.create_table(0, 0, Schema::new()).unwrap();
-        let btree = db.create_index(0, 1).unwrap();
+        let btree = db
+            .create_index(0, 1, |a: &[u8], b: &[u8]| {
+                let a = LittleEndian::read_u32(a);
+                let b = LittleEndian::read_u32(b);
+                Ok(a.cmp(&b))
+            })
+            .unwrap();
 
         btree.build_empty(&db).unwrap();
 
@@ -1211,12 +1204,6 @@ mod tests {
             buf
         };
 
-        let key_comparator = IndexKeyComparator::new(|a: &[u8], b: &[u8]| {
-            let a = LittleEndian::read_u32(a);
-            let b = LittleEndian::read_u32(b);
-            Ok(a.cmp(&b))
-        });
-
         let predicate = IndexScanPredicate::new(|a: &[u8]| {
             let a = LittleEndian::read_u32(a);
             Ok(a > 50)
@@ -1225,13 +1212,11 @@ mod tests {
         for i in 0..300 {
             let key = make_key(300 - i);
             let item_ptr = heap.insert_tuple(&db, &txn, &key).unwrap();
-            assert!(btree.insert(&db, &key, &key_comparator, item_ptr).is_ok());
+            assert!(btree.insert(&db, &key, item_ptr).is_ok());
         }
 
         {
-            let mut iter = btree
-                .begin_scan(&db, &mut txn, &*heap, key_comparator)
-                .unwrap();
+            let mut iter = btree.begin_scan(&db, &mut txn, &*heap).unwrap();
             iter.rescan(&db, None, predicate).unwrap();
 
             let mut count = 0;
