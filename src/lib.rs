@@ -1,5 +1,4 @@
 pub mod am;
-pub mod catalog;
 pub mod concurrency;
 pub mod storage;
 pub mod wal;
