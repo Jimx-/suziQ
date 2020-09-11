@@ -43,7 +43,7 @@ impl<'a> BTreeInsertLog<'a> {
                 page_view.init_page();
             }
 
-            page_view.put_item(self.tuple_data, Some(self.offset as usize), true)?;
+            page_view.put_item(self.tuple_data, Some(self.offset as usize), false)?;
             page_view.set_lsn(lsn);
             page.set_dirty(true);
             Ok(())
@@ -97,7 +97,7 @@ impl BTreeNewRootLog {
             page_view.set_as_root();
 
             for (i, tuple) in self.root_tuples.iter().enumerate() {
-                page_view.put_item(tuple, Some(self.offset as usize + i), true)?;
+                page_view.put_item(tuple, Some(self.offset as usize + i), false)?;
             }
 
             page_view.set_lsn(lsn);
