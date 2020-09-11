@@ -196,8 +196,25 @@ where
 
             // update metadata
             meta_page_view.set_root(root_page_num);
-            meta_page_lock.set_dirty(true);
 
+            // WAL stuffs
+            let new_root_log = BTreeLogRecord::create_btree_new_root_log(
+                RelFileRef {
+                    db: self.rel_db(),
+                    rel_id: self.rel_id(),
+                },
+                ForkType::Main,
+                BTREE_META_PAGE_NUM,
+                root_page_num,
+                0,
+                0,
+                Vec::new(),
+            );
+            let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
+            meta_page_view.set_lsn(lsn);
+            root_page_view.set_lsn(lsn);
+
+            meta_page_lock.set_dirty(true);
             root_page_lock.set_dirty(true);
 
             bufmgr.release_page(*OwningPageWriteLock::into_head(meta_page_lock))?;
@@ -251,29 +268,42 @@ where
         right_tuple.set_downlink(right_page_num);
         let right_tuple_buf = bincode::serialize(&right_tuple).unwrap();
 
+        let level = left_page_view.get_level() + 1;
+
         // initialize the root page
         let mut root_page_view = BTreeDataPageViewMut::new(root_page_lock.buffer_mut());
         root_page_view.set_prev(0);
         root_page_view.set_next(0);
-        root_page_view.set_level(0);
+        root_page_view.set_level(level);
         root_page_view.set_page_type(BTreePageType::Internal);
         root_page_view.set_as_root();
 
         // update metadata
         meta_page_view.set_root(root_page_num);
-        meta_page_lock.set_dirty(true);
 
         // insert the page pointers into the new root page
-        root_page_view.put_item(
-            &left_tuple_buf,
-            Some(root_page_view.high_key_offset()),
-            false,
-        )?;
-        root_page_view.put_item(
-            &right_tuple_buf,
-            Some(root_page_view.high_key_offset() + 1),
-            false,
-        )?;
+        let left_offset = root_page_view.high_key_offset();
+        root_page_view.put_item(&left_tuple_buf, Some(left_offset), false)?;
+        root_page_view.put_item(&right_tuple_buf, Some(left_offset + 1), false)?;
+
+        // WAL stuffs
+        let new_root_log = BTreeLogRecord::create_btree_new_root_log(
+            RelFileRef {
+                db: self.rel_db(),
+                rel_id: self.rel_id(),
+            },
+            ForkType::Main,
+            BTREE_META_PAGE_NUM,
+            root_page_num,
+            level,
+            left_offset,
+            vec![left_tuple_buf, right_tuple_buf],
+        );
+        let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
+        meta_page_view.set_lsn(lsn);
+        root_page_view.set_lsn(lsn);
+
+        meta_page_lock.set_dirty(true);
         root_page_lock.set_dirty(true);
 
         db.get_buffer_manager()

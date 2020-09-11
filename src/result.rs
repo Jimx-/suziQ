@@ -24,22 +24,7 @@ impl From<io::Error> for Error {
     }
 }
 
-impl StdError for Error {
-    fn description(&self) -> &str {
-        use self::Error::*;
-
-        match *self {
-            FileAccess(ref e)
-            | WrongObjectType(ref e)
-            | DataCorrupted(ref e)
-            | ProgramLimitExceed(ref e)
-            | InvalidState(ref e)
-            | InvalidArgument(ref e) => &*e,
-            Io(ref e) => e.description(),
-            OutOfMemory => "out of memory",
-        }
-    }
-}
+impl StdError for Error {}
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
