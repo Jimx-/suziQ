@@ -4,11 +4,11 @@ extern crate libc;
 use crate::{
     am::index::{IndexPtr, IndexScanIterator, IndexScanPredicate},
     concurrency::{IsolationLevel, Transaction},
-    storage::{ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
+    storage::{ForkType, ItemPointer, ScanDirection, TablePtr, TableScanIterator, Tuple},
     DBConfig, Error, Result, DB, OID,
 };
 
-use libc::{c_char, c_int, c_uint};
+use libc::{c_char, c_int, c_uint, c_ulonglong};
 use std::{cell::RefCell, ffi::CStr, path::PathBuf, sync::Arc};
 
 #[no_mangle]
@@ -202,6 +202,28 @@ pub extern "C" fn sq_free_table(table: *const TablePtr) {
     unsafe {
         Box::from_raw(table as *mut TablePtr);
     }
+}
+
+#[no_mangle]
+pub extern "C" fn sq_table_get_file_size(table: *const TablePtr, db: *const DB) -> c_ulonglong {
+    let db = unsafe {
+        assert!(!db.is_null());
+        &*db
+    };
+    let table: &TablePtr = unsafe {
+        assert!(!table.is_null());
+        &*table
+    };
+
+    let file_size = match table.file_size(db, ForkType::Main) {
+        Ok(size) => size,
+        Err(e) => {
+            update_last_error(e);
+            return 0;
+        }
+    };
+
+    file_size as c_ulonglong
 }
 
 #[no_mangle]

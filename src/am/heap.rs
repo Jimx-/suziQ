@@ -622,6 +622,15 @@ impl<'a> TableScanIterator<'a> for HeapScanIterator<'a> {
 }
 
 impl Table for Heap {
+    fn file_size(&self, db: &DB, fork: ForkType) -> Result<usize> {
+        let smgr = db.get_storage_manager();
+
+        self.with_storage(smgr, |storage| {
+            let pages = smgr.file_size_in_page(storage, fork)?;
+            Ok(pages * PAGE_SIZE)
+        })
+    }
+
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer> {
         let htup = self.prepare_heap_tuple_for_insert(txn.xid(), tuple);
         let htup_buf = bincode::serialize(&htup).unwrap();

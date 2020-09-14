@@ -1,6 +1,6 @@
 use crate::{
     concurrency::{Snapshot, Transaction, XID},
-    storage::ItemPointer,
+    storage::{ForkType, ItemPointer},
     Relation, Result, DB,
 };
 
@@ -26,6 +26,8 @@ pub trait TableScanIterator<'a> {
 }
 
 pub trait Table: Relation + Sync + Send {
+    fn file_size(&self, db: &DB, fork: ForkType) -> Result<usize>;
+
     fn insert_tuple(&self, db: &DB, txn: &Transaction, tuple: &[u8]) -> Result<ItemPointer>;
 
     fn begin_scan<'a>(
