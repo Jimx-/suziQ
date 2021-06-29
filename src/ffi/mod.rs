@@ -1,6 +1,3 @@
-extern crate env_logger;
-extern crate libc;
-
 use crate::{
     am::index::{IndexPtr, IndexScanIterator, IndexScanPredicate},
     concurrency::{IsolationLevel, Transaction},
@@ -524,6 +521,7 @@ pub extern "C" fn sq_free_index(index: *const IndexPtr) {
 pub extern "C" fn sq_index_insert(
     index: *const IndexPtr,
     db: *const DB,
+    _txn: *const Transaction,
     key: *const u8,
     length: c_int,
     item_pointer: *const ItemPointer,
