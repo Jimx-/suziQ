@@ -197,7 +197,7 @@ pub extern "C" fn sq_free_table(table: *const TablePtr) {
         return;
     }
     unsafe {
-        Box::from_raw(table as *mut TablePtr);
+        drop(Box::from_raw(table as *mut TablePtr));
     }
 }
 
@@ -263,7 +263,7 @@ pub extern "C" fn sq_free_item_pointer(pointer: *const ItemPointer) {
         return;
     }
     unsafe {
-        Box::from_raw(pointer as *mut ItemPointer);
+        drop(Box::from_raw(pointer as *mut ItemPointer));
     }
 }
 
@@ -305,7 +305,7 @@ pub extern "C" fn sq_free_table_scan_iterator<'a>(
         return;
     }
     unsafe {
-        Box::from_raw(iterator);
+        drop(Box::from_raw(iterator));
     }
 }
 
@@ -352,7 +352,7 @@ pub extern "C" fn sq_free_tuple<'a>(tuple: *const Box<dyn Tuple + 'a>) {
         return;
     }
     unsafe {
-        Box::from_raw(tuple as *mut Box<dyn Tuple + 'a>);
+        drop(Box::from_raw(tuple as *mut Box<dyn Tuple + 'a>));
     }
 }
 
@@ -513,7 +513,7 @@ pub extern "C" fn sq_free_index(index: *const IndexPtr) {
         return;
     }
     unsafe {
-        Box::from_raw(index as *mut IndexPtr);
+        drop(Box::from_raw(index as *mut IndexPtr));
     }
 }
 
@@ -594,7 +594,7 @@ pub extern "C" fn sq_free_index_scan_iterator<'a>(
         return;
     }
     unsafe {
-        Box::from_raw(iterator);
+        drop(Box::from_raw(iterator));
     }
 }
 

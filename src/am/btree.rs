@@ -19,37 +19,42 @@ pub(crate) use self::btree_log::BTreeLogRecord;
 
 use self::btree_page::{views::*, BTreePageFlags, BTreePageType};
 
+use ouroboros::self_referencing;
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, cmp::Ordering, sync::Mutex};
 
-rental! {
-    mod owning_lock {
-        use super::*;
-
-        #[rental(deref_suffix)]
-        /// Own a pinned page and a read lock on that page
-        pub struct OwningPageReadLock {
-            page_ptr: Box<PinnedPagePtr>,
-            page_guard: PageReadGuard<'page_ptr>,
-        }
-
-        #[rental(deref_mut_suffix)]
-        /// Own a pinned page and a write lock on that page
-        pub struct OwningPageWriteLock {
-            page_ptr: Box<PinnedPagePtr>,
-            page_guard: PageWriteGuard<'page_ptr>,
-        }
-    }
+/// Own a pinned page and a read lock on that page
+#[self_referencing]
+struct OwningPageReadLock {
+    page_ptr: PinnedPagePtr,
+    #[borrows(page_ptr)]
+    #[covariant]
+    page_guard: PageReadGuard<'this>,
 }
 
-use self::owning_lock::{OwningPageReadLock, OwningPageWriteLock};
+/// Own a pinned page and a write lock on that page
+#[self_referencing]
+struct OwningPageWriteLock {
+    page_ptr: PinnedPagePtr,
+    #[borrows(page_ptr)]
+    #[covariant]
+    page_guard: PageWriteGuard<'this>,
+}
 
 fn owning_page_read_lock(page_ptr: PinnedPagePtr) -> OwningPageReadLock {
-    OwningPageReadLock::new(Box::new(page_ptr), |p| p.read().unwrap())
+    OwningPageReadLockBuilder {
+        page_ptr,
+        page_guard_builder: |page_ptr| page_ptr.read().unwrap(),
+    }
+    .build()
 }
 
 fn owning_page_write_lock(page_ptr: PinnedPagePtr) -> OwningPageWriteLock {
-    OwningPageWriteLock::new(Box::new(page_ptr), |p| p.write().unwrap())
+    OwningPageWriteLockBuilder {
+        page_ptr,
+        page_guard_builder: |page_ptr| page_ptr.write().unwrap(),
+    }
+    .build()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,16 +163,16 @@ where
         let bufmgr = db.get_buffer_manager();
 
         let meta_page_lock = self.get_tree_page_read(db, Some(BTREE_META_PAGE_NUM))?;
-        let meta_page_view = BTreeMetaPageView::new(meta_page_lock.buffer());
+        let meta_page_view = BTreeMetaPageView::new(meta_page_lock.borrow_page_guard().buffer());
         let root_page_num = meta_page_view.get_root();
 
         if root_page_num == 0 {
-            bufmgr.release_page(*OwningPageReadLock::into_head(meta_page_lock))?;
+            bufmgr.release_page(meta_page_lock.into_heads().page_ptr)?;
 
             Err(Error::InvalidState("root page not created".to_owned()))
         } else {
             let root_page_num = meta_page_view.get_root();
-            bufmgr.release_page(*OwningPageReadLock::into_head(meta_page_lock))?;
+            bufmgr.release_page(meta_page_lock.into_heads().page_ptr)?;
 
             self.get_tree_page_read(db, Some(root_page_num))
         }
@@ -178,51 +183,61 @@ where
         let bufmgr = db.get_buffer_manager();
 
         let mut meta_page_lock = self.get_tree_page_write(db, Some(BTREE_META_PAGE_NUM))?;
-        let mut meta_page_view = BTreeMetaPageViewMut::new(meta_page_lock.buffer_mut());
+        let meta_page_view = BTreeMetaPageView::new(meta_page_lock.borrow_page_guard().buffer());
         let root_page_num = meta_page_view.get_root();
 
         if root_page_num == 0 {
             // no root page yet, create it
             let mut root_page_lock = self.get_tree_page_write(db, None)?;
-            let (_, _, root_page_num) = root_page_lock.get_fork_and_num();
+            let (_, _, root_page_num) = root_page_lock.borrow_page_guard().get_fork_and_num();
 
-            // initialize the root page
-            let mut root_page_view = BTreeDataPageViewMut::new(root_page_lock.buffer_mut());
-            root_page_view.set_prev(0);
-            root_page_view.set_next(0);
-            root_page_view.set_level(0);
-            root_page_view.set_page_type(BTreePageType::Leaf);
-            root_page_view.set_as_root();
+            meta_page_lock.with_page_guard_mut::<Result<()>>(|meta_page_guard| {
+                let mut meta_page_view = BTreeMetaPageViewMut::new(meta_page_guard.buffer_mut());
 
-            // update metadata
-            meta_page_view.set_root(root_page_num);
+                root_page_lock.with_page_guard_mut::<Result<()>>(|root_page_guard| {
+                    // initialize the root page
+                    let mut root_page_view =
+                        BTreeDataPageViewMut::new(root_page_guard.buffer_mut());
+                    root_page_view.set_prev(0);
+                    root_page_view.set_next(0);
+                    root_page_view.set_level(0);
+                    root_page_view.set_page_type(BTreePageType::Leaf);
+                    root_page_view.set_as_root();
 
-            // WAL stuffs
-            let new_root_log = BTreeLogRecord::create_btree_new_root_log(
-                RelFileRef {
-                    db: self.rel_db(),
-                    rel_id: self.rel_id(),
-                },
-                ForkType::Main,
-                BTREE_META_PAGE_NUM,
-                root_page_num,
-                0,
-                0,
-                Vec::new(),
-            );
-            let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
-            meta_page_view.set_lsn(lsn);
-            root_page_view.set_lsn(lsn);
+                    // update metadata
+                    meta_page_view.set_root(root_page_num);
 
-            meta_page_lock.set_dirty(true);
-            root_page_lock.set_dirty(true);
+                    // WAL stuffs
+                    let new_root_log = BTreeLogRecord::create_btree_new_root_log(
+                        RelFileRef {
+                            db: self.rel_db(),
+                            rel_id: self.rel_id(),
+                        },
+                        ForkType::Main,
+                        BTREE_META_PAGE_NUM,
+                        root_page_num,
+                        0,
+                        0,
+                        Vec::new(),
+                    );
+                    let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
+                    meta_page_view.set_lsn(lsn);
+                    root_page_view.set_lsn(lsn);
 
-            bufmgr.release_page(*OwningPageWriteLock::into_head(meta_page_lock))?;
+                    root_page_guard.set_dirty(true);
+                    Ok(())
+                })?;
+
+                meta_page_guard.set_dirty(true);
+                Ok(())
+            })?;
+
+            bufmgr.release_page(meta_page_lock.into_heads().page_ptr)?;
 
             Ok(root_page_lock)
         } else {
             let root_page_num = meta_page_view.get_root();
-            bufmgr.release_page(*OwningPageWriteLock::into_head(meta_page_lock))?;
+            bufmgr.release_page(meta_page_lock.into_heads().page_ptr)?;
 
             self.get_tree_page_write(db, Some(root_page_num))
         }
@@ -236,78 +251,88 @@ where
         rchild: &OwningPageWriteLock,
     ) -> Result<OwningPageWriteLock> {
         let mut root_page_lock = self.get_tree_page_write(db, None)?;
-        let (_, _, root_page_num) = root_page_lock.get_fork_and_num();
+        let (_, _, root_page_num) = root_page_lock.borrow_page_guard().get_fork_and_num();
 
         let mut meta_page_lock = self.get_tree_page_write(db, Some(BTREE_META_PAGE_NUM))?;
-        let mut meta_page_view = BTreeMetaPageViewMut::new(meta_page_lock.buffer_mut());
 
-        // create tuples for downlinks
-        let (_, _, left_page_num) = lchild.get_fork_and_num();
-        let (_, _, right_page_num) = rchild.get_fork_and_num();
-        let mut left_tuple = IndexTuple {
-            key: Cow::from(Vec::new()),
-            item_pointer: ItemPointer::default(),
-        };
-        left_tuple.set_downlink(left_page_num);
-        let left_tuple_buf = bincode::serialize(&left_tuple).unwrap();
+        meta_page_lock.with_page_guard_mut(|meta_page_guard| {
+            let mut meta_page_view = BTreeMetaPageViewMut::new(meta_page_guard.buffer_mut());
 
-        let left_page_view = BTreeDataPageView::new(lchild.buffer());
-        let high_key_buf = left_page_view.get_item(left_page_view.high_key_offset());
-        let high_key = match bincode::deserialize::<IndexTuple>(high_key_buf) {
-            Ok(itup) => itup.key,
-            _ => {
-                return Err(Error::DataCorrupted(
-                    "cannot deserialize index tuple".to_owned(),
-                ));
-            }
-        };
-        let mut right_tuple = IndexTuple {
-            key: high_key,
-            item_pointer: ItemPointer::default(),
-        };
-        right_tuple.set_downlink(right_page_num);
-        let right_tuple_buf = bincode::serialize(&right_tuple).unwrap();
+            // create tuples for downlinks
+            let (_, _, left_page_num) = lchild.borrow_page_guard().get_fork_and_num();
+            let (_, _, right_page_num) = rchild.borrow_page_guard().get_fork_and_num();
+            let mut left_tuple = IndexTuple {
+                key: Cow::from(Vec::new()),
+                item_pointer: ItemPointer::default(),
+            };
+            left_tuple.set_downlink(left_page_num);
+            let left_tuple_buf = bincode::serialize(&left_tuple).unwrap();
 
-        let level = left_page_view.get_level() + 1;
+            let left_page_view = BTreeDataPageView::new(lchild.borrow_page_guard().buffer());
+            let high_key_buf = left_page_view.get_item(left_page_view.high_key_offset());
+            let high_key = match bincode::deserialize::<IndexTuple>(high_key_buf) {
+                Ok(itup) => itup.key,
+                _ => {
+                    return Err(Error::DataCorrupted(
+                        "cannot deserialize index tuple".to_owned(),
+                    ));
+                }
+            };
+            let mut right_tuple = IndexTuple {
+                key: high_key,
+                item_pointer: ItemPointer::default(),
+            };
+            right_tuple.set_downlink(right_page_num);
+            let right_tuple_buf = bincode::serialize(&right_tuple).unwrap();
 
-        // initialize the root page
-        let mut root_page_view = BTreeDataPageViewMut::new(root_page_lock.buffer_mut());
-        root_page_view.set_prev(0);
-        root_page_view.set_next(0);
-        root_page_view.set_level(level);
-        root_page_view.set_page_type(BTreePageType::Internal);
-        root_page_view.set_as_root();
+            let level = left_page_view.get_level() + 1;
 
-        // update metadata
-        meta_page_view.set_root(root_page_num);
+            root_page_lock.with_page_guard_mut::<Result<()>>(|root_page_guard| {
+                // initialize the root page
+                let mut root_page_view = BTreeDataPageViewMut::new(root_page_guard.buffer_mut());
+                root_page_view.set_prev(0);
+                root_page_view.set_next(0);
+                root_page_view.set_level(level);
+                root_page_view.set_page_type(BTreePageType::Internal);
+                root_page_view.set_as_root();
 
-        // insert the page pointers into the new root page
-        let left_offset = root_page_view.high_key_offset();
-        root_page_view.put_item(&left_tuple_buf, Some(left_offset), false)?;
-        root_page_view.put_item(&right_tuple_buf, Some(left_offset + 1), false)?;
+                // update metadata
+                meta_page_view.set_root(root_page_num);
 
-        // WAL stuffs
-        let new_root_log = BTreeLogRecord::create_btree_new_root_log(
-            RelFileRef {
-                db: self.rel_db(),
-                rel_id: self.rel_id(),
-            },
-            ForkType::Main,
-            BTREE_META_PAGE_NUM,
-            root_page_num,
-            level,
-            left_offset,
-            vec![left_tuple_buf, right_tuple_buf],
-        );
-        let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
-        meta_page_view.set_lsn(lsn);
-        root_page_view.set_lsn(lsn);
+                // insert the page pointers into the new root page
+                let left_offset = root_page_view.high_key_offset();
+                root_page_view.put_item(&left_tuple_buf, Some(left_offset), false)?;
+                root_page_view.put_item(&right_tuple_buf, Some(left_offset + 1), false)?;
 
-        meta_page_lock.set_dirty(true);
-        root_page_lock.set_dirty(true);
+                // WAL stuffs
+                let new_root_log = BTreeLogRecord::create_btree_new_root_log(
+                    RelFileRef {
+                        db: self.rel_db(),
+                        rel_id: self.rel_id(),
+                    },
+                    ForkType::Main,
+                    BTREE_META_PAGE_NUM,
+                    root_page_num,
+                    level,
+                    left_offset,
+                    vec![left_tuple_buf, right_tuple_buf],
+                );
+                let (_, lsn) = db.get_wal().append(XID::default(), new_root_log)?;
+                meta_page_view.set_lsn(lsn);
+                root_page_view.set_lsn(lsn);
+
+                root_page_guard.set_dirty(true);
+
+                Ok(())
+            })?;
+
+            meta_page_guard.set_dirty(true);
+
+            Ok(())
+        })?;
 
         db.get_buffer_manager()
-            .release_page(*OwningPageWriteLock::into_head(meta_page_lock))?;
+            .release_page(meta_page_lock.into_heads().page_ptr)?;
 
         Ok(root_page_lock)
     }
@@ -318,8 +343,8 @@ where
         let mut path = Vec::new();
 
         loop {
-            let (_, _, parent_page_num) = page_lock.get_fork_and_num();
-            let page_view = BTreeDataPageView::new(page_lock.buffer());
+            let (_, _, parent_page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+            let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
 
             if page_view.page_type() == BTreePageType::Leaf {
                 break;
@@ -341,7 +366,7 @@ where
 
             // release the lock on current page after acquiring the lock on the child page
             db.get_buffer_manager()
-                .release_page(*OwningPageReadLock::into_head(page_lock))?;
+                .release_page(page_lock.into_heads().page_ptr)?;
 
             path.push(ItemPointer::new(parent_page_num, child_offset));
 
@@ -357,8 +382,8 @@ where
         let mut path = Vec::new();
 
         loop {
-            let (_, _, parent_page_num) = page_lock.get_fork_and_num();
-            let page_view = BTreeDataPageView::new(page_lock.buffer());
+            let (_, _, parent_page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+            let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
 
             if page_view.page_type() == BTreePageType::Leaf {
                 break;
@@ -384,7 +409,7 @@ where
 
             // release the lock on current page after acquiring the lock on the child page
             db.get_buffer_manager()
-                .release_page(*OwningPageReadLock::into_head(page_lock))?;
+                .release_page(page_lock.into_heads().page_ptr)?;
 
             path.push(ItemPointer::new(parent_page_num, child_offset));
 
@@ -400,9 +425,9 @@ where
         let mut path = Vec::new();
 
         loop {
-            let (_, _, parent_page_num) = page_lock.get_fork_and_num();
+            let (_, _, parent_page_num) = page_lock.borrow_page_guard().get_fork_and_num();
 
-            let page_view = BTreeDataPageView::new(page_lock.buffer());
+            let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
             if page_view.page_type() == BTreePageType::Leaf {
                 break;
             }
@@ -423,7 +448,7 @@ where
 
             // release the lock on current page after acquiring the lock on the child page
             db.get_buffer_manager()
-                .release_page(*OwningPageWriteLock::into_head(page_lock))?;
+                .release_page(page_lock.into_heads().page_ptr)?;
 
             path.push(ItemPointer::new(parent_page_num, child_offset));
 
@@ -529,7 +554,7 @@ where
     ) -> Result<(OwningPageWriteLock, usize)> {
         let page_lock = start_page;
 
-        let page_view = BTreeDataPageView::new(page_lock.buffer());
+        let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
         let offset = self.binary_search_page(&page_view, key, item_ptr, false)?;
         Ok((page_lock, offset))
     }
@@ -543,13 +568,13 @@ where
         page: OwningPageWriteLock,
     ) -> Result<(OwningPageWriteLock, OwningPageWriteLock)> {
         let mut page_lock = page;
-        let (_, _, page_num) = page_lock.get_fork_and_num();
-        let page_view = BTreeDataPageView::new(page_lock.buffer());
+        let (_, _, page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+        let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
 
         let first_right = self.get_split_location(&page_view)?;
 
         // allocate and initialize temp buffer for the left page
-        let mut left_page_buffer = *page_lock.buffer();
+        let mut left_page_buffer = *page_lock.borrow_page_guard().buffer();
         let mut left_page_view = BTreeDataPageViewMut::new(&mut left_page_buffer);
         left_page_view.init_page();
         left_page_view.set_flags(page_view.get_flags());
@@ -572,79 +597,88 @@ where
 
         // allocate and initialize the right page
         let mut right_page_lock = self.get_tree_page_write(db, None)?;
-        let (_, _, right_page_num) = right_page_lock.get_fork_and_num();
+        let (_, _, right_page_num) = right_page_lock.borrow_page_guard().get_fork_and_num();
         left_page_view.set_next(right_page_num);
-        let mut right_page_view = BTreeDataPageViewMut::new(right_page_lock.buffer_mut());
-        right_page_view.set_flags(page_view.get_flags());
-        right_page_view.clear_flags(BTreePageFlags::IS_ROOT);
-        right_page_view.set_prev(page_num);
-        right_page_view.set_next(page_view.get_next());
 
-        // add the high key (if any) to the right page
-        let mut right_offset = page_view.high_key_offset();
-        if !page_view.is_rightmost() {
-            let high_key = page_view.get_item(page_view.high_key_offset());
-            right_page_view.put_item(high_key, Some(right_offset), false)?;
-            right_offset += 1;
-        }
+        right_page_lock.with_page_guard_mut::<Result<()>>(|page_guard| {
+            let mut right_page_view = BTreeDataPageViewMut::new(page_guard.buffer_mut());
+            right_page_view.set_flags(page_view.get_flags());
+            right_page_view.clear_flags(BTreePageFlags::IS_ROOT);
+            right_page_view.set_prev(page_num);
+            right_page_view.set_next(page_view.get_next());
 
-        // copy keys into the two pages
-        for i in page_view.first_key_offset()..=page_view.num_line_pointers() {
-            let key = page_view.get_item(i);
+            // add the high key (if any) to the right page
+            let mut right_offset = page_view.high_key_offset();
+            if !page_view.is_rightmost() {
+                let high_key = page_view.get_item(page_view.high_key_offset());
+                right_page_view.put_item(high_key, Some(right_offset), false)?;
+                right_offset += 1;
+            }
 
-            if i == offset {
-                if offset < first_right {
-                    left_page_view.put_item(tuple, Some(left_offset), false)?;
+            // copy keys into the two pages
+            for i in page_view.first_key_offset()..=page_view.num_line_pointers() {
+                let key = page_view.get_item(i);
+
+                if i == offset {
+                    if offset < first_right {
+                        left_page_view.put_item(tuple, Some(left_offset), false)?;
+                        left_offset += 1;
+                    } else {
+                        right_page_view.put_item(tuple, Some(right_offset), false)?;
+                        right_offset += 1;
+                    }
+                }
+
+                if i < first_right {
+                    left_page_view.put_item(key, Some(left_offset), false)?;
                     left_offset += 1;
                 } else {
-                    right_page_view.put_item(tuple, Some(right_offset), false)?;
+                    right_page_view.put_item(key, Some(right_offset), false)?;
                     right_offset += 1;
                 }
             }
 
-            if i < first_right {
-                left_page_view.put_item(key, Some(left_offset), false)?;
-                left_offset += 1;
-            } else {
-                right_page_view.put_item(key, Some(right_offset), false)?;
-                right_offset += 1;
+            // add the new tuple if it is at the end
+            if offset > page_view.num_line_pointers() {
+                right_page_view.put_item(tuple, Some(right_offset), false)?;
             }
-        }
 
-        // add the new tuple if it is at the end
-        if offset > page_view.num_line_pointers() {
-            right_page_view.put_item(tuple, Some(right_offset), false)?;
-        }
+            // fetch the right sibling (if any) to update prev page number
+            let mut right_sibling_lock = if page_view.is_rightmost() {
+                None
+            } else {
+                Some(self.get_tree_page_write(db, Some(page_view.get_next()))?)
+            };
 
-        // fetch the right sibling (if any) to update prev page number
-        let mut right_sibling_lock = if page_view.is_rightmost() {
-            None
-        } else {
-            Some(self.get_tree_page_write(db, Some(page_view.get_next()))?)
-        };
+            page_guard.set_dirty(true);
+
+            // set the prev page number of the right sibling
+            if let Some(lock) = &mut right_sibling_lock {
+                lock.with_page_guard_mut(|page_guard| {
+                    let mut rs_page_view = BTreeDataPageViewMut::new(page_guard.buffer_mut());
+                    rs_page_view.set_prev(right_page_num);
+                    page_guard.set_dirty(true);
+                });
+            }
+
+            // TODO: WAL
+
+            // release the right sibling
+            if let Some(lock) = right_sibling_lock {
+                db.get_buffer_manager()
+                    .release_page(lock.into_heads().page_ptr)?;
+            }
+
+            Ok(())
+        })?;
 
         // finalize the split
-        page_lock
-            .buffer_mut()
-            .copy_from_slice(&left_page_buffer[..]);
-
-        page_lock.set_dirty(true);
-        right_page_lock.set_dirty(true);
-
-        // set the prev page number of the right sibling
-        if let Some(lock) = &mut right_sibling_lock {
-            let mut rs_page_view = BTreeDataPageViewMut::new(lock.buffer_mut());
-            rs_page_view.set_prev(right_page_num);
-            lock.set_dirty(true);
-        }
-
-        // TODO: WAL
-
-        // release the right sibling
-        if let Some(lock) = right_sibling_lock {
-            db.get_buffer_manager()
-                .release_page(*OwningPageWriteLock::into_head(lock))?;
-        }
+        page_lock.with_page_guard_mut(|page_guard| {
+            page_guard
+                .buffer_mut()
+                .copy_from_slice(&left_page_buffer[..]);
+            page_guard.set_dirty(true);
+        });
 
         Ok((page_lock, right_page_lock))
     }
@@ -659,8 +693,8 @@ where
         path: TreePath,
     ) -> Result<()> {
         let mut page_lock = page;
-        let (_, _, page_num) = page_lock.get_fork_and_num();
-        let mut page_view = BTreeDataPageViewMut::new(page_lock.buffer_mut());
+        let (_, _, page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+        let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
 
         if page_view.get_free_space() < tuple.len() {
             // split
@@ -671,24 +705,30 @@ where
 
             self.insert_into_parent(db, path, left_page_lock, right_page_lock, is_root)
         } else {
-            page_view.put_item(tuple, Some(offset), false)?;
+            page_lock.with_page_guard_mut::<Result<()>>(|page_guard| {
+                let mut page_view = BTreeDataPageViewMut::new(page_guard.buffer_mut());
 
-            let insert_log = BTreeLogRecord::create_btree_insert_log(
-                RelFileRef {
-                    db: self.rel_db(),
-                    rel_id: self.rel_id(),
-                },
-                ForkType::Main,
-                page_num,
-                offset,
-                tuple,
-            );
-            let (_, lsn) = db.get_wal().append(XID::default(), insert_log)?;
-            page_view.set_lsn(lsn);
-            page_lock.set_dirty(true);
+                page_view.put_item(tuple, Some(offset), false)?;
+
+                let insert_log = BTreeLogRecord::create_btree_insert_log(
+                    RelFileRef {
+                        db: self.rel_db(),
+                        rel_id: self.rel_id(),
+                    },
+                    ForkType::Main,
+                    page_num,
+                    offset,
+                    tuple,
+                );
+                let (_, lsn) = db.get_wal().append(XID::default(), insert_log)?;
+                page_view.set_lsn(lsn);
+
+                Ok(())
+            })?;
+            page_lock.with_page_guard_mut(|page_guard| page_guard.set_dirty(true));
 
             db.get_buffer_manager()
-                .release_page(*OwningPageWriteLock::into_head(page_lock))
+                .release_page(page_lock.into_heads().page_ptr)
         }
     }
 
@@ -709,7 +749,7 @@ where
                 mut offset,
             }) => loop {
                 let parent_lock = self.get_tree_page_write(db, Some(page_num))?;
-                let page_view = BTreeDataPageView::new(parent_lock.buffer());
+                let page_view = BTreeDataPageView::new(parent_lock.borrow_page_guard().buffer());
                 let min_off = page_view.first_key_offset();
                 let max_off = page_view.num_line_pointers();
 
@@ -751,7 +791,7 @@ where
                 }
 
                 if page_view.is_rightmost() {
-                    bufmgr.release_page(*OwningPageWriteLock::into_head(parent_lock))?;
+                    bufmgr.release_page(parent_lock.into_heads().page_ptr)?;
                     return Err(Error::DataCorrupted(format!(
                         "cannot re-find parent key for split page {}",
                         child_page_num
@@ -760,7 +800,7 @@ where
 
                 page_num = page_view.get_next();
                 offset = 0;
-                bufmgr.release_page(*OwningPageWriteLock::into_head(parent_lock))?;
+                bufmgr.release_page(parent_lock.into_heads().page_ptr)?;
             },
             _ => unreachable!(),
         }
@@ -779,15 +819,15 @@ where
 
         if is_root {
             let root_page_lock = self.new_root(db, &lchild_lock, &rchild_lock)?;
-            bufmgr.release_page(*OwningPageWriteLock::into_head(root_page_lock))?;
-            bufmgr.release_page(*OwningPageWriteLock::into_head(rchild_lock))?;
-            bufmgr.release_page(*OwningPageWriteLock::into_head(lchild_lock))?;
+            bufmgr.release_page(root_page_lock.into_heads().page_ptr)?;
+            bufmgr.release_page(rchild_lock.into_heads().page_ptr)?;
+            bufmgr.release_page(lchild_lock.into_heads().page_ptr)?;
             Ok(())
         } else {
             // prepare the downlink tuple for the right child
-            let (_, _, left_page_num) = lchild_lock.get_fork_and_num();
-            let (_, _, right_page_num) = rchild_lock.get_fork_and_num();
-            let left_page_view = BTreeDataPageView::new(lchild_lock.buffer());
+            let (_, _, left_page_num) = lchild_lock.borrow_page_guard().get_fork_and_num();
+            let (_, _, right_page_num) = rchild_lock.borrow_page_guard().get_fork_and_num();
+            let left_page_view = BTreeDataPageView::new(lchild_lock.borrow_page_guard().buffer());
             let high_key_buf = left_page_view.get_item(left_page_view.high_key_offset());
             let high_key = match bincode::deserialize::<IndexTuple>(high_key_buf) {
                 Ok(itup) => itup.key,
@@ -807,8 +847,8 @@ where
             let (parent_lock, path, ItemPointer { offset, .. }) =
                 self.walk_up_path(db, path, left_page_num)?;
 
-            bufmgr.release_page(*OwningPageWriteLock::into_head(rchild_lock))?;
-            bufmgr.release_page(*OwningPageWriteLock::into_head(lchild_lock))?;
+            bufmgr.release_page(rchild_lock.into_heads().page_ptr)?;
+            bufmgr.release_page(lchild_lock.into_heads().page_ptr)?;
 
             self.insert_into_page(db, &right_tuple_buf, offset + 1, parent_lock, path)
         }
@@ -821,8 +861,8 @@ where
         dir: ScanDirection,
     ) -> Result<Option<ItemPointer>> {
         let page_lock = self.get_endpoint(db, dir == ScanDirection::Backward)?;
-        let (_, _, page_num) = page_lock.get_fork_and_num();
-        let page_view = BTreeDataPageView::new(page_lock.buffer());
+        let (_, _, page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+        let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
         let offset = match dir {
             ScanDirection::Forward => page_view.first_key_offset(),
             ScanDirection::Backward => page_view.num_line_pointers(),
@@ -831,7 +871,7 @@ where
         iterator.read_page(&page_view, dir, offset)?;
 
         db.get_buffer_manager()
-            .release_page(*OwningPageReadLock::into_head(page_lock))?;
+            .release_page(page_lock.into_heads().page_ptr)?;
 
         if iterator.items.is_empty() {
             // no items
@@ -855,15 +895,15 @@ where
         match start_key {
             Some(start_key) => {
                 let (page_lock, _) = self.search_read(db, &start_key)?;
-                let (_, _, page_num) = page_lock.get_fork_and_num();
-                let page_view = BTreeDataPageView::new(page_lock.buffer());
+                let (_, _, page_num) = page_lock.borrow_page_guard().get_fork_and_num();
+                let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
                 let offset =
                     self.binary_search_page(&page_view, &start_key, ItemPointer::default(), false)?;
 
                 iterator.read_page(&page_view, dir, offset)?;
 
                 db.get_buffer_manager()
-                    .release_page(*OwningPageReadLock::into_head(page_lock))?;
+                    .release_page(page_lock.into_heads().page_ptr)?;
 
                 if iterator.items.is_empty() {
                     // no items
@@ -895,7 +935,7 @@ where
                 }
 
                 let page_lock = self.get_tree_page_read(db, Some(page_num))?;
-                let page_view = BTreeDataPageView::new(page_lock.buffer());
+                let page_view = BTreeDataPageView::new(page_lock.borrow_page_guard().buffer());
 
                 iterator.read_page(&page_view, dir, page_view.first_key_offset())?;
 
@@ -905,7 +945,7 @@ where
 
                 page_num = page_view.get_next();
                 db.get_buffer_manager()
-                    .release_page(*OwningPageReadLock::into_head(page_lock))?;
+                    .release_page(page_lock.into_heads().page_ptr)?;
             },
             ScanDirection::Backward => {
                 return Ok(None);
